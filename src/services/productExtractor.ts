@@ -1,4 +1,10 @@
 import { ProductVariant } from '../types/cms';
+import {
+  detectProductType,
+  findCanonicalOption,
+  loadManagedCategories,
+  normalizeTaxonomyLabel,
+} from './productCatalogTaxonomy';
 
 export interface ExtractedProductData {
   name: string;
@@ -613,6 +619,26 @@ export function extractProductFromHtml(
   const imageUrls = Array.from(imageSet).filter(Boolean).slice(0, 12);
   const primaryImage = imageUrls[0] || '';
   const featuresSpecs = specsList.join(' • ').slice(0, 3000);
+  const extractedTags = Array.from(tagsSet).slice(0, 20);
+
+  // Infer product type locally from title, URL slug, metadata, tags, and description/specs
+  const typeDetection = detectProductType({
+    name,
+    productUrl,
+    rawProductType: productType,
+    category,
+    shortDescription,
+    featuresSpecs,
+    tags: extractedTags,
+  });
+  const resolvedProductType = typeDetection.isConfident
+    ? typeDetection.detectedType
+    : normalizeTaxonomyLabel(productType) || 'Other';
+
+  const cleanCategory = normalizeTaxonomyLabel(category);
+  const resolvedCategory = cleanCategory
+    ? findCanonicalOption(cleanCategory, loadManagedCategories()) || cleanCategory
+    : '';
 
   if (!name) {
     warnings.push('Could not automatically detect the product title from page metadata.');
@@ -640,12 +666,12 @@ export function extractProductFromHtml(
     shortDescription: shortDescription.slice(0, 2000),
     imageUrl: primaryImage,
     imageUrls,
-    category: category.slice(0, 120),
-    productType: productType.slice(0, 120),
+    category: resolvedCategory.slice(0, 120),
+    productType: resolvedProductType.slice(0, 120),
     sku: sku.slice(0, 120),
     featuresSpecs,
     variants: variants.slice(0, 40),
-    tags: Array.from(tagsSet).slice(0, 20),
+    tags: extractedTags,
     dataSource,
     fetchStatus,
     warnings,

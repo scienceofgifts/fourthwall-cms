@@ -1,4 +1,12 @@
 import { Product } from '../types/cms';
+import {
+  MANAGED_PRODUCT_TYPES,
+  detectProductType,
+  findCanonicalOption,
+  isPlaceholderProductType,
+  loadManagedCategories,
+  normalizeTaxonomyLabel,
+} from './productCatalogTaxonomy';
 
 export interface ParsedProductRow {
   rowNumber: number;
@@ -161,8 +169,8 @@ export function parseProductImportBatch(rawInput: string): ProductImportReport {
     const name = getCol(['name', 'title', 'productname'], 0);
     const productUrl = getCol(['producturl', 'url', 'link', 'href'], 1);
     const rawPrice = getCol(['price', 'cost'], 2);
-    const productType = getCol(['producttype', 'type'], 3) || 'Apparel & Goods';
-    const category = getCol(['category', 'deity', 'theme', 'era'], 4) || 'General';
+    const rawProductTypeCol = normalizeTaxonomyLabel(getCol(['producttype', 'type'], 3));
+    const rawCategoryCol = normalizeTaxonomyLabel(getCol(['category', 'deity', 'theme', 'era'], 4));
     const shortDescription = getCol(['shortdescription', 'description', 'summary'], 5);
     const featuresSpecs = getCol(['featuresspecs', 'specs', 'features', 'specifications'], 6);
     const imageUrl = getCol(['imageurl', 'image', 'img'], 7);
@@ -194,6 +202,21 @@ export function parseProductImportBatch(rawInput: string): ProductImportReport {
       return;
     }
 
+    const managedCategories = loadManagedCategories();
+    const category = rawCategoryCol
+      ? findCanonicalOption(rawCategoryCol, managedCategories) || rawCategoryCol
+      : 'General History';
+
+    const hasExplicitType = !isPlaceholderProductType(rawProductTypeCol);
+    const productType = hasExplicitType
+      ? findCanonicalOption(rawProductTypeCol, MANAGED_PRODUCT_TYPES) || rawProductTypeCol
+      : detectProductType({
+          name,
+          productUrl,
+          shortDescription,
+          featuresSpecs,
+        }).detectedType;
+
     const tags = rawTags
       ? rawTags
           .split(/[;|,]/)
@@ -210,6 +233,7 @@ export function parseProductImportBatch(rawInput: string): ProductImportReport {
       price: priceCheck.formatted,
       currency: 'USD',
       productType: productType.slice(0, 120),
+      productTypeManualOverride: hasExplicitType ? true : undefined,
       category: category.slice(0, 120),
       tags,
       shortDescription: shortDescription.slice(0, 2000),

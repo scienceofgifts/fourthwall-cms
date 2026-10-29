@@ -42,6 +42,7 @@ import {
   subscribeToGuides,
   subscribeToProducts,
   updateUserSettings,
+  validateUserAuthToken,
 } from './services/firebase';
 import {
   SEED_GREEK_GUIDE,
@@ -129,39 +130,60 @@ export default function App() {
 
   // Auth listener
   useEffect(() => {
+    const applyLocalFallbackState = () => {
+      const cached = loadLocalCatalogProducts();
+      const localProds: Product[] =
+        cached && cached.length > 0
+          ? cached
+          : SEED_PRODUCTS.map((p) => ({
+              ...p,
+              ownerId: 'local-preview',
+              dataSource: 'seed' as const,
+              fetchStatus: 'success' as const,
+            }));
+      const localGuide: GiftGuide = {
+        ...SEED_GREEK_GUIDE,
+        ownerId: 'local-preview',
+      };
+      const localSecs: GuideSection[] = SEED_GREEK_SECTIONS.map((s) => ({
+        ...s,
+        ownerId: 'local-preview',
+      }));
+      setProducts(localProds);
+      setGuides([localGuide]);
+      setActiveGuide(localGuide);
+      setActiveSections(localSecs);
+    };
+
     const unsub = onAuthStateChanged(auth, async (currUser) => {
-      setUser(currUser);
-      setAuthReady(true);
       if (currUser) {
+        const tokenCheck = await validateUserAuthToken(currUser);
+        if (!tokenCheck.valid) {
+          setUser(null);
+          setAuthReady(true);
+          if (tokenCheck.reason) {
+            setAuthError(tokenCheck.reason);
+          }
+          applyLocalFallbackState();
+          return;
+        }
+        setUser(currUser);
+        setAuthReady(true);
         try {
           const settings = await ensureUserSettings(currUser);
           setUserSettings(settings);
-        } catch (err) {
-          console.error('Failed to initialize user settings:', err);
+        } catch {
+          setUserSettings({
+            ownerId: currUser.uid,
+            displayName: (currUser.displayName || currUser.email || 'Editor').slice(0, 120),
+            defaultStoreBaseUrl: 'https://scienceofgifts.com',
+            schemaVersion: 1,
+          });
         }
       } else {
-        const cached = loadLocalCatalogProducts();
-        const localProds: Product[] =
-          cached && cached.length > 0
-            ? cached
-            : SEED_PRODUCTS.map((p) => ({
-                ...p,
-                ownerId: 'local-preview',
-                dataSource: 'seed' as const,
-                fetchStatus: 'success' as const,
-              }));
-        const localGuide: GiftGuide = {
-          ...SEED_GREEK_GUIDE,
-          ownerId: 'local-preview',
-        };
-        const localSecs: GuideSection[] = SEED_GREEK_SECTIONS.map((s) => ({
-          ...s,
-          ownerId: 'local-preview',
-        }));
-        setProducts(localProds);
-        setGuides([localGuide]);
-        setActiveGuide(localGuide);
-        setActiveSections(localSecs);
+        setUser(null);
+        setAuthReady(true);
+        applyLocalFallbackState();
       }
     });
     return () => unsub();

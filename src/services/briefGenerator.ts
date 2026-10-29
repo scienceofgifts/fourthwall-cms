@@ -1,4 +1,9 @@
 import { Product } from '../types/cms';
+import {
+  detectProductType,
+  isPlaceholderProductType,
+  normalizeTaxonomyLabel,
+} from './productCatalogTaxonomy';
 import { ExtractedProductData } from './productExtractor';
 
 export type BriefAssistantTarget = 'chatgpt' | 'gemini';
@@ -133,13 +138,19 @@ export function mergeRefreshedProductData(
     extracted.shortDescription
   );
   const mergedImage = pickNonEmpty('imageUrl', 'Primary Image URL', existing.imageUrl, extracted.imageUrl);
-  const mergedCategory = pickNonEmpty('category', 'Category', existing.category, extracted.category);
-  const mergedType = pickNonEmpty(
-    'productType',
-    'Product Type',
-    existing.productType,
-    extracted.productType
-  );
+
+  // Preserve user-selected category if already populated; otherwise adopt extracted category
+  const cleanExistingCat = normalizeTaxonomyLabel(existing.category);
+  const cleanExtractedCat = normalizeTaxonomyLabel(extracted.category);
+  let mergedCategory = cleanExistingCat;
+  if (!cleanExistingCat || cleanExistingCat.toLowerCase() === 'general') {
+    mergedCategory = pickNonEmpty('category', 'Category', existing.category, cleanExtractedCat);
+  } else if (cleanExtractedCat && cleanExtractedCat !== cleanExistingCat) {
+    preservedFields.push('Category');
+  } else if (cleanExistingCat) {
+    preservedFields.push('Category');
+  }
+
   const mergedSku = pickNonEmpty('sku', 'SKU', existing.sku, extracted.sku);
   const mergedSpecs = pickNonEmpty(
     'featuresSpecs',
@@ -147,6 +158,30 @@ export function mergeRefreshedProductData(
     existing.featuresSpecs,
     extracted.featuresSpecs
   );
+
+  // Never overwrite a manually confirmed productType during refresh
+  const cleanExistingType = normalizeTaxonomyLabel(existing.productType);
+  const hasConfirmedExistingType =
+    Boolean(existing.productTypeManualOverride) ||
+    (!isPlaceholderProductType(cleanExistingType) && cleanExistingType.toLowerCase() !== 'other');
+
+  let mergedType = cleanExistingType;
+  if (hasConfirmedExistingType) {
+    preservedFields.push('Product Type');
+  } else {
+    const inferredRefreshType =
+      !isPlaceholderProductType(extracted.productType) && extracted.productType !== 'Other'
+        ? extracted.productType
+        : detectProductType({
+            name: mergedName,
+            productUrl: existing.productUrl,
+            rawProductType: extracted.productType,
+            shortDescription: mergedDesc,
+            featuresSpecs: mergedSpecs,
+            tags: extracted.tags,
+          }).detectedType;
+    mergedType = pickNonEmpty('productType', 'Product Type', existing.productType, inferredRefreshType);
+  }
 
   // Merge imageUrls without losing existing images if new extraction is empty
   const mergedImageUrls =
@@ -186,6 +221,7 @@ export function mergeRefreshedProductData(
     imageUrls: mergedImageUrls,
     category: mergedCategory,
     productType: mergedType,
+    productTypeManualOverride: existing.productTypeManualOverride,
     sku: mergedSku || undefined,
     featuresSpecs: mergedSpecs,
     variants: mergedVariants,

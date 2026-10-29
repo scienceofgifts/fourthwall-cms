@@ -42,6 +42,19 @@ import {
 } from '../services/briefGenerator';
 import { buildEditorialSvgDataUri, SEED_PRODUCTS } from '../data/greekMythologySeed';
 import { getSavedGeminiModelPreference } from '../services/geminiModelConfig';
+import {
+  MANAGED_PRODUCT_TYPES,
+  ProductTypeDetectionResult,
+  addManagedCategory,
+  detectProductType,
+  findCanonicalOption,
+  getUncatalogedProductCategories,
+  isPlaceholderProductType,
+  loadManagedCategories,
+  normalizeTaxonomyLabel,
+  renameManagedCategory,
+  toTaxonomyKey,
+} from '../services/productCatalogTaxonomy';
 
 interface ProductLibraryViewProps {
   products: Product[];
@@ -155,16 +168,55 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
   // Delete confirmation state
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
+  // Managed Categories & Product Type Detection UI state
+  const [managedCategories, setManagedCategories] = useState<string[]>(() =>
+    loadManagedCategories()
+  );
+  const [categorySearchFilter, setCategorySearchFilter] = useState('');
+  const [showAddCategoryInline, setShowAddCategoryInline] = useState(false);
+  const [newCategoryNameInput, setNewCategoryNameInput] = useState('');
+  const [showRenameCategoryInline, setShowRenameCategoryInline] = useState(false);
+  const [renameCategoryDraft, setRenameCategoryDraft] = useState('');
+  const [detectedTypeInfo, setDetectedTypeInfo] = useState<ProductTypeDetectionResult | null>(
+    null
+  );
+
+  const uncatalogedCategories = useMemo(
+    () => getUncatalogedProductCategories(products, managedCategories),
+    [products, managedCategories]
+  );
+
   const categories = useMemo(() => {
-    const set = new Set<string>();
-    products.forEach((p) => p.category && set.add(p.category));
-    return ['ALL', ...Array.from(set).sort()];
-  }, [products]);
+    const seen = new Set<string>();
+    const list: string[] = [];
+    for (const c of [...managedCategories, ...uncatalogedCategories]) {
+      const clean = normalizeTaxonomyLabel(c);
+      if (!clean) continue;
+      const key = toTaxonomyKey(clean);
+      if (!seen.has(key)) {
+        seen.add(key);
+        list.push(clean);
+      }
+    }
+    return ['ALL', ...list];
+  }, [managedCategories, uncatalogedCategories]);
 
   const productTypes = useMemo(() => {
-    const set = new Set<string>();
-    products.forEach((p) => p.productType && set.add(p.productType));
-    return ['ALL', ...Array.from(set).sort()];
+    const seen = new Set<string>();
+    const list: string[] = [];
+    for (const t of [
+      ...MANAGED_PRODUCT_TYPES,
+      ...products.map((p) => p.productType).filter(Boolean),
+    ]) {
+      const clean = normalizeTaxonomyLabel(t);
+      if (!clean || isPlaceholderProductType(clean)) continue;
+      const key = toTaxonomyKey(clean);
+      if (!seen.has(key)) {
+        seen.add(key);
+        list.push(clean);
+      }
+    }
+    return ['ALL', ...list];
   }, [products]);
 
   const filteredProducts = useMemo(() => {
@@ -263,21 +315,59 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
 
     const extraImgs = (extracted.imageUrls || []).filter((u) => u !== extracted.imageUrl);
 
+    const resolvedName = extracted.name || existingMatch?.name || '';
+    const resolvedDesc = extracted.shortDescription || existingMatch?.shortDescription || '';
+    const resolvedSpecs = extracted.featuresSpecs || existingMatch?.featuresSpecs || '';
+
+    // Preserve a manually confirmed productType on existingMatch; otherwise infer locally
+    const hasConfirmedExistingType =
+      existingMatch &&
+      (existingMatch.productTypeManualOverride ||
+        (!isPlaceholderProductType(existingMatch.productType) &&
+          toTaxonomyKey(existingMatch.productType) !== 'other'));
+
+    const localDetection = detectProductType({
+      name: resolvedName,
+      productUrl: resolvedUrl,
+      rawProductType: extracted.productType,
+      category: extracted.category || existingMatch?.category,
+      shortDescription: resolvedDesc,
+      featuresSpecs: resolvedSpecs,
+      tags: initialTags,
+    });
+
+    const resolvedProductType = hasConfirmedExistingType
+      ? findCanonicalOption(existingMatch.productType, MANAGED_PRODUCT_TYPES) ||
+        existingMatch.productType
+      : localDetection.isConfident
+      ? localDetection.detectedType
+      : 'Other';
+
+    const rawExtractedCat = normalizeTaxonomyLabel(extracted.category || '');
+    const rawExistingCat = normalizeTaxonomyLabel(existingMatch?.category || '');
+    const resolvedCategory =
+      rawExistingCat && toTaxonomyKey(rawExistingCat) !== 'general'
+        ? findCanonicalOption(rawExistingCat, managedCategories) || rawExistingCat
+        : rawExtractedCat
+        ? findCanonicalOption(rawExtractedCat, managedCategories) || rawExtractedCat
+        : 'General History';
+
     setEditingProduct({
       id,
-      name: extracted.name || existingMatch?.name || '',
+      name: resolvedName,
       productUrl: resolvedUrl,
       imageUrl: extracted.imageUrl || existingMatch?.imageUrl || '',
       imageUrls: extracted.imageUrls || existingMatch?.imageUrls || [],
       price: extracted.price || existingMatch?.price || '',
       originalPrice: extracted.originalPrice || existingMatch?.originalPrice || '',
       currency: extracted.currency || existingMatch?.currency || 'USD',
-      productType: extracted.productType || existingMatch?.productType || '',
-      category: extracted.category || existingMatch?.category || '',
+      productType: resolvedProductType,
+      productTypeManualOverride: hasConfirmedExistingType ? true : false,
+      category: resolvedCategory,
       sku: extracted.sku || existingMatch?.sku || '',
       tags: initialTags,
-      shortDescription: extracted.shortDescription || existingMatch?.shortDescription || '',
-      featuresSpecs: extracted.featuresSpecs || existingMatch?.featuresSpecs || '',
+      shortDescription: resolvedDesc,
+      featuresSpecs: resolvedSpecs,
       sourceNotes: existingMatch?.sourceNotes || '',
       variants:
         extracted.variants && extracted.variants.length > 0
@@ -288,6 +378,10 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       fetchStatus: extracted.fetchStatus,
       archived: existingMatch?.archived || false,
     });
+    setDetectedTypeInfo(localDetection);
+    setCategorySearchFilter('');
+    setShowAddCategoryInline(false);
+    setShowRenameCategoryInline(false);
     setTagsInput(initialTags.join(', '));
     setAdditionalImagesInput(extraImgs.join('\n'));
     setIsExistingEdit(Boolean(existingMatch));
@@ -457,6 +551,7 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
   };
 
   const openNewProductModal = (prefillUrl = '') => {
+    const initialDetection = detectProductType({ productUrl: prefillUrl });
     setEditingProduct({
       id: '',
       name: '',
@@ -466,8 +561,9 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       price: '',
       originalPrice: '',
       currency: 'USD',
-      productType: '',
-      category: '',
+      productType: initialDetection.isConfident ? initialDetection.detectedType : 'Other',
+      productTypeManualOverride: false,
+      category: managedCategories[0] || 'General History',
       sku: '',
       tags: [],
       shortDescription: '',
@@ -479,6 +575,10 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       fetchStatus: 'manual',
       archived: false,
     });
+    setDetectedTypeInfo(initialDetection);
+    setCategorySearchFilter('');
+    setShowAddCategoryInline(false);
+    setShowRenameCategoryInline(false);
     setTagsInput('');
     setAdditionalImagesInput('');
     setExtractionWarnings([]);
@@ -488,6 +588,26 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
 
   const openEditProductModal = (prod: Product) => {
     const extraImgs = (prod.imageUrls || []).filter((u) => u !== prod.imageUrl);
+    const localDetection = detectProductType({
+      name: prod.name,
+      productUrl: prod.productUrl,
+      shortDescription: prod.shortDescription,
+      featuresSpecs: prod.featuresSpecs,
+      tags: prod.tags,
+    });
+
+    const hasExistingSpecificType = !isPlaceholderProductType(prod.productType);
+    const resolvedType = hasExistingSpecificType
+      ? findCanonicalOption(prod.productType, MANAGED_PRODUCT_TYPES) || prod.productType
+      : localDetection.isConfident
+      ? localDetection.detectedType
+      : 'Other';
+
+    const cleanCat = normalizeTaxonomyLabel(prod.category);
+    const resolvedCat = cleanCat
+      ? findCanonicalOption(cleanCat, managedCategories) || cleanCat
+      : 'General History';
+
     setEditingProduct({
       id: prod.id,
       name: prod.name,
@@ -497,8 +617,11 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       price: prod.price === 'Unavailable' ? '' : prod.price,
       originalPrice: prod.originalPrice || '',
       currency: prod.currency || 'USD',
-      productType: prod.productType,
-      category: prod.category,
+      productType: resolvedType,
+      productTypeManualOverride: hasExistingSpecificType
+        ? prod.productTypeManualOverride ?? true
+        : false,
+      category: resolvedCat,
       sku: prod.sku || '',
       tags: prod.tags || [],
       shortDescription: prod.shortDescription,
@@ -510,6 +633,10 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       fetchStatus: prod.fetchStatus || 'manual',
       archived: prod.archived,
     });
+    setDetectedTypeInfo(localDetection);
+    setCategorySearchFilter('');
+    setShowAddCategoryInline(false);
+    setShowRenameCategoryInline(false);
     setTagsInput((prod.tags || []).join(', '));
     setAdditionalImagesInput(extraImgs.join('\n'));
     setExtractionWarnings([]);
@@ -573,6 +700,19 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       ])
     ).slice(0, 12);
 
+    const finalCategory =
+      normalizeTaxonomyLabel(editingProduct.category) || 'General History';
+    const rawSelectedType = normalizeTaxonomyLabel(editingProduct.productType);
+    const finalProductType = !isPlaceholderProductType(rawSelectedType)
+      ? findCanonicalOption(rawSelectedType, MANAGED_PRODUCT_TYPES) || rawSelectedType
+      : detectProductType({
+          name,
+          productUrl: url,
+          shortDescription: editingProduct.shortDescription,
+          featuresSpecs: editingProduct.featuresSpecs,
+          tags: parsedTags,
+        }).detectedType;
+
     setSavingProduct(true);
     setFormError(null);
     try {
@@ -582,6 +722,9 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
           id: finalId,
           name,
           productUrl: url,
+          category: finalCategory,
+          productType: finalProductType,
+          productTypeManualOverride: Boolean(editingProduct.productTypeManualOverride),
           imageUrl: editingProduct.imageUrl.trim() || allImageUrls[0] || '',
           imageUrls: allImageUrls,
           price: formattedPrice,
@@ -1341,9 +1484,25 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
                     type="text"
                     required
                     value={editingProduct.name}
-                    onChange={(e) =>
-                      setEditingProduct({ ...editingProduct, name: e.target.value })
-                    }
+                    onChange={(e) => {
+                      const nextName = e.target.value;
+                      const nextDetection = detectProductType({
+                        name: nextName,
+                        productUrl: editingProduct.productUrl,
+                        shortDescription: editingProduct.shortDescription,
+                        featuresSpecs: editingProduct.featuresSpecs,
+                      });
+                      setDetectedTypeInfo(nextDetection);
+                      setEditingProduct({
+                        ...editingProduct,
+                        name: nextName,
+                        productType: editingProduct.productTypeManualOverride
+                          ? editingProduct.productType
+                          : nextDetection.isConfident
+                          ? nextDetection.detectedType
+                          : editingProduct.productType || 'Other',
+                      });
+                    }}
                     placeholder="e.g., Hades Ruler of the Underworld Tee"
                     className="sog-input"
                   />
@@ -1370,9 +1529,25 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
                     type="text"
                     required
                     value={editingProduct.productUrl}
-                    onChange={(e) =>
-                      setEditingProduct({ ...editingProduct, productUrl: e.target.value })
-                    }
+                    onChange={(e) => {
+                      const nextUrl = e.target.value;
+                      const nextDetection = detectProductType({
+                        name: editingProduct.name,
+                        productUrl: nextUrl,
+                        shortDescription: editingProduct.shortDescription,
+                        featuresSpecs: editingProduct.featuresSpecs,
+                      });
+                      setDetectedTypeInfo(nextDetection);
+                      setEditingProduct({
+                        ...editingProduct,
+                        productUrl: nextUrl,
+                        productType: editingProduct.productTypeManualOverride
+                          ? editingProduct.productType
+                          : nextDetection.isConfident
+                          ? nextDetection.detectedType
+                          : editingProduct.productType || 'Other',
+                      });
+                    }}
                     placeholder="/products/hades-greek-mythology-shirt-ruler-of-the-underworld-t-shirt"
                     className="sog-input font-mono-tabular"
                   />
@@ -1419,30 +1594,333 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
                   />
                 </div>
 
+                {/* Searchable Category / Theme Dropdown + Add / Rename Category */}
                 <div>
-                  <label className="sog-label">Category / Theme</label>
-                  <input
-                    type="text"
-                    value={editingProduct.category}
-                    onChange={(e) =>
-                      setEditingProduct({ ...editingProduct, category: e.target.value })
-                    }
-                    placeholder="e.g., Hades, Athena, Roman Republic"
-                    className="sog-input"
-                  />
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <label className="sog-label mb-0">Category / Theme</label>
+                    <div className="flex items-center gap-2 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowAddCategoryInline((prev) => !prev);
+                          setShowRenameCategoryInline(false);
+                          setNewCategoryNameInput('');
+                        }}
+                        className="font-semibold text-[#1A567B] hover:underline"
+                      >
+                        + Add New
+                      </button>
+                      {editingProduct.category && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowRenameCategoryInline((prev) => !prev);
+                            setShowAddCategoryInline(false);
+                            setRenameCategoryDraft(editingProduct.category);
+                          }}
+                          className="text-[#5E6B7C] hover:text-[#111A27] hover:underline"
+                          title="Rename this category across the catalog"
+                        >
+                          Rename
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <input
+                      type="text"
+                      value={categorySearchFilter}
+                      onChange={(e) => setCategorySearchFilter(e.target.value)}
+                      placeholder="Filter categories..."
+                      aria-label="Filter categories"
+                      className="sog-input py-1 text-[11px]"
+                    />
+                    <select
+                      value={editingProduct.category}
+                      onChange={(e) =>
+                        setEditingProduct({ ...editingProduct, category: e.target.value })
+                      }
+                      aria-label="Category / Theme"
+                      className="sog-input"
+                    >
+                      {(() => {
+                        const filterKey = categorySearchFilter.trim().toLowerCase();
+                        const currentCat = normalizeTaxonomyLabel(editingProduct.category);
+                        const filteredManaged = managedCategories.filter(
+                          (c) =>
+                            !filterKey ||
+                            c.toLowerCase().includes(filterKey) ||
+                            toTaxonomyKey(c) === toTaxonomyKey(currentCat)
+                        );
+                        const filteredUncataloged = uncatalogedCategories.filter(
+                          (c) =>
+                            !filterKey ||
+                            c.toLowerCase().includes(filterKey) ||
+                            toTaxonomyKey(c) === toTaxonomyKey(currentCat)
+                        );
+                        const isCurrentInEither =
+                          findCanonicalOption(currentCat, filteredManaged) ||
+                          findCanonicalOption(currentCat, filteredUncataloged);
+
+                        return (
+                          <>
+                            <option value="">Select a category...</option>
+                            {currentCat && !isCurrentInEither && (
+                              <option value={currentCat}>
+                                {currentCat} (Preserved from product)
+                              </option>
+                            )}
+                            <optgroup label="Managed Categories">
+                              {filteredManaged.map((cat) => (
+                                <option key={cat} value={cat}>
+                                  {cat}
+                                </option>
+                              ))}
+                            </optgroup>
+                            {filteredUncataloged.length > 0 && (
+                              <optgroup label="Existing Product Categories (Not Yet in Managed List)">
+                                {filteredUncataloged.map((cat) => (
+                                  <option key={`uncat-${cat}`} value={cat}>
+                                    {cat}
+                                  </option>
+                                ))}
+                              </optgroup>
+                            )}
+                          </>
+                        );
+                      })()}
+                    </select>
+
+                    {/* Prompt to add uncataloged existing product category to managed options */}
+                    {editingProduct.category &&
+                      !findCanonicalOption(editingProduct.category, managedCategories) && (
+                        <div className="flex items-center justify-between gap-2 px-2 py-1 bg-[#EFF6FA] border border-[#94C0D6] rounded text-[11px] text-[#123E59]">
+                          <span className="truncate">
+                            &ldquo;{editingProduct.category}&rdquo; is not in managed options yet.
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const res = addManagedCategory(
+                                editingProduct.category,
+                                managedCategories
+                              );
+                              setManagedCategories(res.categories);
+                              setEditingProduct({
+                                ...editingProduct,
+                                category: res.canonicalName,
+                              });
+                              onShowToast?.(
+                                `Added "${res.canonicalName}" to managed categories.`
+                              );
+                            }}
+                            className="font-semibold underline shrink-0 hover:text-[#111A27]"
+                          >
+                            + Add to Managed List
+                          </button>
+                        </div>
+                      )}
+
+                    {/* Inline Add New Category */}
+                    {showAddCategoryInline && (
+                      <div className="p-2 bg-[#F3EFE6] border border-[#D5CFC0] rounded-lg space-y-1.5">
+                        <label className="block text-[11px] font-semibold text-[#111A27]">
+                          New Category Name
+                        </label>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="text"
+                            value={newCategoryNameInput}
+                            onChange={(e) => setNewCategoryNameInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                const res = addManagedCategory(
+                                  newCategoryNameInput,
+                                  managedCategories
+                                );
+                                if (res.canonicalName) {
+                                  setManagedCategories(res.categories);
+                                  setEditingProduct({
+                                    ...editingProduct,
+                                    category: res.canonicalName,
+                                  });
+                                  setShowAddCategoryInline(false);
+                                  setNewCategoryNameInput('');
+                                  onShowToast?.(
+                                    res.added
+                                      ? `Created category "${res.canonicalName}".`
+                                      : `Selected existing category "${res.canonicalName}".`
+                                  );
+                                }
+                              }
+                            }}
+                            placeholder="e.g., Cold War, Ancient Egypt"
+                            className="sog-input py-1 text-[11px] flex-1"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const res = addManagedCategory(
+                                newCategoryNameInput,
+                                managedCategories
+                              );
+                              if (res.canonicalName) {
+                                setManagedCategories(res.categories);
+                                setEditingProduct({
+                                  ...editingProduct,
+                                  category: res.canonicalName,
+                                });
+                                setShowAddCategoryInline(false);
+                                setNewCategoryNameInput('');
+                                onShowToast?.(
+                                  res.added
+                                    ? `Created category "${res.canonicalName}".`
+                                    : `Selected existing category "${res.canonicalName}".`
+                                );
+                              }
+                            }}
+                            className="sog-btn-primary py-1 px-2.5 text-[11px]"
+                          >
+                            Add
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setShowAddCategoryInline(false)}
+                            className="text-[11px] text-[#5E6B7C] hover:text-[#111A27] px-1"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Inline Rename Category (preserves product associations) */}
+                    {showRenameCategoryInline && editingProduct.category && (
+                      <div className="p-2 bg-[#F3EFE6] border border-[#D5CFC0] rounded-lg space-y-1.5">
+                        <label className="block text-[11px] font-semibold text-[#111A27]">
+                          Rename &ldquo;{editingProduct.category}&rdquo; across catalog
+                        </label>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="text"
+                            value={renameCategoryDraft}
+                            onChange={(e) => setRenameCategoryDraft(e.target.value)}
+                            placeholder="New category name..."
+                            className="sog-input py-1 text-[11px] flex-1"
+                          />
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const res = renameManagedCategory(
+                                editingProduct.category,
+                                renameCategoryDraft,
+                                products,
+                                managedCategories
+                              );
+                              setManagedCategories(res.categories);
+                              setEditingProduct({
+                                ...editingProduct,
+                                category: res.canonicalNewName,
+                              });
+                              setShowRenameCategoryInline(false);
+                              if (res.changedProducts.length > 0) {
+                                await onBatchImportProducts(res.changedProducts);
+                              }
+                              onShowToast?.(
+                                `Renamed category to "${res.canonicalNewName}" (${res.changedProducts.length} product(s) updated).`
+                              );
+                            }}
+                            className="sog-btn-primary py-1 px-2.5 text-[11px]"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setShowRenameCategoryInline(false)}
+                            className="text-[11px] text-[#5E6B7C] hover:text-[#111A27] px-1"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
 
+                {/* Product Type Dropdown with Automatic Local Detection & Manual Override Preservation */}
                 <div>
-                  <label className="sog-label">Product Type</label>
-                  <input
-                    type="text"
-                    value={editingProduct.productType}
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <label className="sog-label mb-0">Product Type</label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const redetected = detectProductType({
+                          name: editingProduct.name,
+                          productUrl: editingProduct.productUrl,
+                          shortDescription: editingProduct.shortDescription,
+                          featuresSpecs: editingProduct.featuresSpecs,
+                          tags: editingProduct.tags,
+                        });
+                        setDetectedTypeInfo(redetected);
+                        setEditingProduct({
+                          ...editingProduct,
+                          productType: redetected.isConfident
+                            ? redetected.detectedType
+                            : 'Other',
+                          productTypeManualOverride: false,
+                        });
+                      }}
+                      className="text-[11px] font-semibold text-[#1A567B] hover:underline"
+                      title="Re-detect product type from title and URL"
+                    >
+                      Auto-Detect
+                    </button>
+                  </div>
+
+                  <select
+                    value={editingProduct.productType || 'Other'}
                     onChange={(e) =>
-                      setEditingProduct({ ...editingProduct, productType: e.target.value })
+                      setEditingProduct({
+                        ...editingProduct,
+                        productType: e.target.value,
+                        productTypeManualOverride: true,
+                      })
                     }
-                    placeholder="e.g., T-Shirt, Hoodie, Spiral Journal"
+                    aria-label="Product Type"
                     className="sog-input"
-                  />
+                  >
+                    {editingProduct.productType &&
+                      !findCanonicalOption(
+                        editingProduct.productType,
+                        MANAGED_PRODUCT_TYPES
+                      ) && (
+                        <option value={editingProduct.productType}>
+                          {editingProduct.productType} (Preserved custom type)
+                        </option>
+                      )}
+                    {MANAGED_PRODUCT_TYPES.map((typeOpt) => (
+                      <option key={typeOpt} value={typeOpt}>
+                        {typeOpt}
+                      </option>
+                    ))}
+                  </select>
+
+                  <p className="text-[11px] text-[#5E6B7C] mt-1">
+                    {editingProduct.productTypeManualOverride ? (
+                      <span>
+                        Manual selection locked (preserved during edits &amp; URL refreshes)
+                      </span>
+                    ) : detectedTypeInfo?.isConfident ? (
+                      <span className="text-[#134634]">
+                        Auto-detected <strong>{detectedTypeInfo.detectedType}</strong> from{' '}
+                        {detectedTypeInfo.matchedSource.replace('_', ' ')}
+                      </span>
+                    ) : (
+                      <span>Could not confidently infer specific type — defaulted to Other</span>
+                    )}
+                  </p>
                 </div>
 
                 <div>

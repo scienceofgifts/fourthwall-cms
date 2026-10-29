@@ -19,6 +19,7 @@ import {
   query,
   serverTimestamp,
   setDoc,
+  setLogLevel,
   updateDoc,
   where,
   writeBatch,
@@ -41,9 +42,18 @@ import {
   SEED_PRODUCTS,
 } from '../data/greekMythologySeed';
 import { ensureProjectHasSections } from './htmlWorkspaceEngine';
+import {
+  loadManagedCategories,
+  migrateAndHydrateProductRecord,
+} from './productCatalogTaxonomy';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+try {
+  setLogLevel('silent');
+} catch {
+  // Ignore if setLogLevel is unavailable in test environment
+}
 export const auth = getAuth(app);
 
 export enum OperationType {
@@ -72,6 +82,51 @@ export interface FirestoreErrorInfo {
   };
 }
 
+export function isOfflineOrTokenServiceError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error ?? '');
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes('the client is offline') ||
+    lower.includes('failed to get document because the client is offline') ||
+    lower.includes('token-service-api-has-not-been-used') ||
+    lower.includes('securetoken.googleapis.com') ||
+    lower.includes('fetching auth token failed') ||
+    lower.includes('client is offline') ||
+    lower.includes('unavailable') ||
+    lower.includes('network-request-failed')
+  );
+}
+
+export async function validateUserAuthToken(
+  user: User
+): Promise<{ valid: boolean; reason?: string }> {
+  try {
+    await user.getIdToken();
+    return { valid: true };
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error ?? '');
+    try {
+      await signOut(auth);
+    } catch {
+      // Ignore sign-out cleanup error
+    }
+    if (
+      msg.includes('token-service-api-has-not-been-used') ||
+      msg.includes('securetoken.googleapis.com')
+    ) {
+      return {
+        valid: false,
+        reason:
+          'Cloud sync paused: Token Service API (securetoken.googleapis.com) is disabled in the Google Cloud project. Running in Local Storage mode.',
+      };
+    }
+    return {
+      valid: false,
+      reason: 'Previous cloud session expired or could not be refreshed. Running in Local Storage mode.',
+    };
+  }
+}
+
 export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
@@ -94,21 +149,28 @@ export function handleFirestoreError(
     operationType,
     path,
   };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  if (!isOfflineOrTokenServiceError(error)) {
+    console.warn('Firestore Error: ', JSON.stringify(errInfo));
+  }
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Validate connection to Firestore on boot
+// Validate connection to Firestore after auth state settles
 async function testConnection() {
   try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
+    if (typeof auth.authStateReady === 'function') {
+      await auth.authStateReady();
     }
+    if (auth.currentUser) {
+      const check = await validateUserAuthToken(auth.currentUser);
+      if (!check.valid) return;
+    }
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch {
+    // Offline or unconfigured Firestore falls back cleanly to Local Storage mode
   }
 }
-testConnection();
+void testConnection();
 
 export function sanitizeId(rawId: string): string {
   const cleaned = (rawId || '')
@@ -123,6 +185,13 @@ export function sanitizeId(rawId: string): string {
 export async function signInWithGooglePopup(): Promise<User> {
   const provider = new GoogleAuthProvider();
   const result = await signInWithPopup(auth, provider);
+  const tokenCheck = await validateUserAuthToken(result.user);
+  if (!tokenCheck.valid) {
+    throw new Error(
+      tokenCheck.reason ||
+        'Signed in, but Firebase Token Service API is unavailable. Running in Local Storage mode.'
+    );
+  }
   return result.user;
 }
 
@@ -139,22 +208,28 @@ export type { User };
 export async function ensureUserSettings(user: User): Promise<UserSettings> {
   const path = `users/${user.uid}`;
   const ref = doc(db, 'users', user.uid);
+  const fallbackSettings: UserSettings = {
+    ownerId: user.uid,
+    displayName: (user.displayName || user.email || 'Editor').slice(0, 120),
+    defaultStoreBaseUrl: 'https://scienceofgifts.com',
+    schemaVersion: 1,
+  };
   try {
     const snap = await getDoc(ref);
     if (snap.exists()) {
       return snap.data() as UserSettings;
     }
     const payload = {
-      ownerId: user.uid,
-      displayName: (user.displayName || user.email || 'Editor').slice(0, 120),
-      defaultStoreBaseUrl: 'https://scienceofgifts.com',
-      schemaVersion: 1,
+      ...fallbackSettings,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     };
     await setDoc(ref, payload);
     return payload;
   } catch (error) {
+    if (isOfflineOrTokenServiceError(error)) {
+      return fallbackSettings;
+    }
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
@@ -189,6 +264,7 @@ interface PackedProductMeta {
   dataSource?: Product['dataSource'];
   fetchStatus?: Product['fetchStatus'];
   priceEmpty?: boolean;
+  productTypeManualOverride?: boolean;
 }
 
 function packSourceNotesWithMeta(
@@ -209,6 +285,9 @@ function packSourceNotesWithMeta(
   if (prod.fetchStatus) meta.fetchStatus = prod.fetchStatus;
   if (!prod.price || prod.price.trim() === '' || prod.price.trim() === 'Unavailable') {
     meta.priceEmpty = true;
+  }
+  if (prod.productTypeManualOverride) {
+    meta.productTypeManualOverride = true;
   }
 
   const hasMeta = Object.keys(meta).length > 0;
@@ -248,19 +327,24 @@ export function unpackProductFromFirestoreDoc(
   const resolvedPrice =
     unpackedMeta.priceEmpty || rawDoc.price === 'Unavailable' ? '' : rawDoc.price;
 
-  return {
-    ...rawDoc,
-    id,
-    price: resolvedPrice,
-    sourceNotes: cleanNotes,
-    originalPrice: unpackedMeta.originalPrice ?? rawDoc.originalPrice,
-    sku: unpackedMeta.sku ?? rawDoc.sku,
-    imageUrls: unpackedMeta.imageUrls ?? rawDoc.imageUrls,
-    variants: unpackedMeta.variants ?? rawDoc.variants,
-    lastFetchedAt: unpackedMeta.lastFetchedAt ?? rawDoc.lastFetchedAt,
-    dataSource: unpackedMeta.dataSource ?? rawDoc.dataSource,
-    fetchStatus: unpackedMeta.fetchStatus ?? rawDoc.fetchStatus,
-  };
+  return migrateAndHydrateProductRecord(
+    {
+      ...rawDoc,
+      id,
+      price: resolvedPrice,
+      sourceNotes: cleanNotes,
+      originalPrice: unpackedMeta.originalPrice ?? rawDoc.originalPrice,
+      sku: unpackedMeta.sku ?? rawDoc.sku,
+      imageUrls: unpackedMeta.imageUrls ?? rawDoc.imageUrls,
+      variants: unpackedMeta.variants ?? rawDoc.variants,
+      lastFetchedAt: unpackedMeta.lastFetchedAt ?? rawDoc.lastFetchedAt,
+      dataSource: unpackedMeta.dataSource ?? rawDoc.dataSource,
+      fetchStatus: unpackedMeta.fetchStatus ?? rawDoc.fetchStatus,
+      productTypeManualOverride:
+        unpackedMeta.productTypeManualOverride ?? rawDoc.productTypeManualOverride,
+    },
+    loadManagedCategories()
+  );
 }
 
 const LOCAL_PRODUCTS_STORAGE_KEY = 'sog_catalog_products_v2';
@@ -271,7 +355,9 @@ export function loadLocalCatalogProducts(): Product[] | null {
     const raw = window.localStorage.getItem(LOCAL_PRODUCTS_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as Product[]) : null;
+    if (!Array.isArray(parsed)) return null;
+    const managedCats = loadManagedCategories();
+    return (parsed as Product[]).map((p) => migrateAndHydrateProductRecord(p, managedCats));
   } catch {
     return null;
   }
@@ -351,6 +437,9 @@ export async function saveProductToFirestore(
     });
     return prodId;
   } catch (error) {
+    if (isOfflineOrTokenServiceError(error)) {
+      return prodId;
+    }
     handleFirestoreError(error, isExisting ? OperationType.UPDATE : OperationType.CREATE, path);
   }
 }
@@ -360,6 +449,9 @@ export async function deleteProductFromFirestore(userId: string, productId: stri
   try {
     await deleteDoc(doc(db, 'users', userId, 'products', productId));
   } catch (error) {
+    if (isOfflineOrTokenServiceError(error)) {
+      return;
+    }
     handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
@@ -383,6 +475,7 @@ export function subscribeToProducts(
     },
     (err) => {
       if (onError) onError(err);
+      if (isOfflineOrTokenServiceError(err)) return;
       handleFirestoreError(err, OperationType.LIST, path);
     }
   );
@@ -453,6 +546,7 @@ export function subscribeToGuides(
     },
     (err) => {
       if (onError) onError(err);
+      if (isOfflineOrTokenServiceError(err)) return;
       handleFirestoreError(err, OperationType.LIST, path);
     }
   );
@@ -1235,6 +1329,9 @@ export async function saveHtmlProjectToFirestore(
     });
     return cleanId;
   } catch (error) {
+    if (isOfflineOrTokenServiceError(error)) {
+      return cleanId;
+    }
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
@@ -1248,6 +1345,9 @@ export async function deleteHtmlProjectFromFirestore(
   try {
     await deleteDoc(doc(db, 'users', userId, 'htmlProjects', cleanId));
   } catch (error) {
+    if (isOfflineOrTokenServiceError(error)) {
+      return;
+    }
     handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
@@ -1311,6 +1411,7 @@ export function subscribeToHtmlProjects(
     },
     (err) => {
       if (onError) onError(err);
+      if (isOfflineOrTokenServiceError(err)) return;
       handleFirestoreError(err, OperationType.LIST, path);
     }
   );

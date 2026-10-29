@@ -65,11 +65,25 @@ import {
   deleteHtmlProject,
   duplicateHtmlProject,
   getActiveLocalHtmlProjectId,
+  isOfflineOrTokenServiceError,
+  loadLocalCatalogProducts,
   loadLocalHtmlProjects,
   renameHtmlProject,
   saveHtmlProject,
+  saveLocalCatalogProducts,
   validateHtmlProjectForSave,
+  validateUserAuthToken,
 } from './services/firebase';
+import {
+  INITIAL_PRODUCT_CATEGORIES,
+  MANAGED_PRODUCT_TYPES,
+  addManagedCategory,
+  detectProductType,
+  getUncatalogedProductCategories,
+  loadManagedCategories,
+  migrateAndHydrateProductRecord,
+  renameManagedCategory,
+} from './services/productCatalogTaxonomy';
 import {
   DEFAULT_GEMINI_MODEL_ID,
   GEMINI_MODEL_DEFINITIONS,
@@ -2026,6 +2040,373 @@ describe('Feature 7: Cloudflare Workers Deployment & Gemini Model Selector with 
     expect(parseJson.ok).toBe(true);
     expect(parseJson.extracted.name).toBe('Athena Owl Sweatshirt');
     expect(geminiCalledCount).toBe(0);
+  });
+
+  it('detects Firebase offline and disabled Token Service API errors and validates user tokens cleanly', async () => {
+    expect(
+      isOfflineOrTokenServiceError(
+        new Error(
+          'Firebase: Error (auth/token-service-api-has-not-been-used-in-project-339975832814-before-or-it-is-disabled).'
+        )
+      )
+    ).toBe(true);
+    expect(
+      isOfflineOrTokenServiceError(
+        new Error('Failed to get document because the client is offline.')
+      )
+    ).toBe(true);
+    expect(isOfflineOrTokenServiceError(new Error('Missing or insufficient permissions.'))).toBe(
+      false
+    );
+
+    const brokenUser = {
+      uid: 'user-broken-token',
+      getIdToken: async () => {
+        throw new Error(
+          'Firebase: Error (auth/token-service-api-has-not-been-used-in-project-339975832814-before-or-it-is-disabled).'
+        );
+      },
+    } as unknown as Parameters<typeof validateUserAuthToken>[0];
+
+    const brokenCheck = await validateUserAuthToken(brokenUser);
+    expect(brokenCheck.valid).toBe(false);
+    expect(brokenCheck.reason).toContain('Token Service API');
+
+    const validUser = {
+      uid: 'user-valid-token',
+      getIdToken: async () => 'mock-jwt-token',
+    } as unknown as Parameters<typeof validateUserAuthToken>[0];
+
+    const validCheck = await validateUserAuthToken(validUser);
+    expect(validCheck.valid).toBe(true);
+  });
+});
+
+describe('Feature 8: Product Catalog Category Dropdown & Automatic Product Type Detection', () => {
+  it('1 & 2. provides initial categories, creates custom categories without capitalization/whitespace duplicates, persists them, and renames categories without losing product associations', () => {
+    const store = new Map<string, string>();
+    const prevWindow = (globalThis as any).window;
+    (globalThis as any).window = {
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => store.set(k, v),
+        removeItem: (k: string) => store.delete(k),
+      },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => true,
+    };
+
+    try {
+      const initial = loadManagedCategories();
+      expect(initial).toEqual([
+        'General History',
+        'American History',
+        'World War II',
+        'Civil War',
+        'Ancient Rome',
+        'Greek Mythology',
+        'History Teachers',
+        'Other',
+      ]);
+
+      // Create a custom category
+      const addedRes = addManagedCategory('  Cold   War  ', initial);
+      expect(addedRes.added).toBe(true);
+      expect(addedRes.canonicalName).toBe('Cold War');
+      expect(addedRes.categories).toContain('Cold War');
+      expect(addedRes.categories[addedRes.categories.length - 1]).toBe('Other');
+
+      // Duplicate with different casing/whitespace should NOT create a duplicate entry
+      const dupRes = addManagedCategory('cold war', addedRes.categories);
+      expect(dupRes.added).toBe(false);
+      expect(dupRes.canonicalName).toBe('Cold War');
+      expect(dupRes.categories.filter((c) => c.toLowerCase() === 'cold war').length).toBe(1);
+
+      // Verify persistence in localStorage across reload
+      const reloaded = loadManagedCategories();
+      expect(reloaded).toContain('Cold War');
+
+      // Rename category and verify all associated products update cleanly
+      const testProds: Product[] = [
+        {
+          ...sampleProducts[0],
+          id: 'p-1',
+          category: 'Cold War',
+        },
+        {
+          ...sampleProducts[1],
+          id: 'p-2',
+          category: 'American History',
+        },
+      ];
+      const renameRes = renameManagedCategory(
+        'Cold War',
+        '20th Century Geopolitics',
+        testProds,
+        reloaded
+      );
+      expect(renameRes.canonicalNewName).toBe('20th Century Geopolitics');
+      expect(renameRes.categories).toContain('20th Century Geopolitics');
+      expect(renameRes.categories).not.toContain('Cold War');
+      expect(renameRes.changedProducts.length).toBe(1);
+      expect(renameRes.updatedProducts.find((p) => p.id === 'p-1')?.category).toBe(
+        '20th Century Geopolitics'
+      );
+      expect(renameRes.updatedProducts.find((p) => p.id === 'p-2')?.category).toBe(
+        'American History'
+      );
+    } finally {
+      (globalThis as any).window = prevWindow;
+    }
+  });
+
+  it('3. detects product types accurately from representative product titles, URL slugs, and metadata', () => {
+    expect(MANAGED_PRODUCT_TYPES).toEqual([
+      'T-Shirt',
+      'Hoodie',
+      'Sweatshirt',
+      'Mug',
+      'Water Bottle',
+      'Tumbler',
+      'Rocks Glass',
+      'Beer Can Glass',
+      'Whiskey Glass',
+      'Poster',
+      'Journal',
+      'Notebook',
+      'Tote Bag',
+      'Desk Mat',
+      'Laptop Sleeve',
+      'Mouse Pad',
+      'iPhone Case',
+      'Cap',
+      'Other',
+    ]);
+
+    // Required representative examples from prompt
+    expect(detectProductType({ name: 'The Original Hottake 1943 T-Shirt' })).toMatchObject({
+      detectedType: 'T-Shirt',
+      isConfident: true,
+      matchedSource: 'title',
+    });
+    expect(detectProductType({ name: 'Abraham Lincoln Superhero Hoodie' })).toMatchObject({
+      detectedType: 'Hoodie',
+      isConfident: true,
+      matchedSource: 'title',
+    });
+    expect(detectProductType({ name: 'WWII Buff Mug' })).toMatchObject({
+      detectedType: 'Mug',
+      isConfident: true,
+      matchedSource: 'title',
+    });
+    expect(detectProductType({ name: 'Civil War Whiskey Glass' })).toMatchObject({
+      detectedType: 'Whiskey Glass',
+      isConfident: true,
+      matchedSource: 'title',
+    });
+    expect(detectProductType({ name: 'History Vintage Statue Themed Tumbler' })).toMatchObject({
+      detectedType: 'Tumbler',
+      isConfident: true,
+      matchedSource: 'title',
+    });
+    expect(detectProductType({ name: 'Abraham Lincoln History Poster' })).toMatchObject({
+      detectedType: 'Poster',
+      isConfident: true,
+      matchedSource: 'title',
+    });
+
+    // Additional managed product types (via title & URL slug)
+    expect(
+      detectProductType({
+        name: 'Charon Ferry Crewneck Sweatshirt',
+        productUrl: '/products/charon-ferry-sweatshirt',
+      }).detectedType
+    ).toBe('Sweatshirt');
+    expect(
+      detectProductType({
+        name: 'Poseidon Trident Stainless Steel Water Bottle',
+      }).detectedType
+    ).toBe('Water Bottle');
+    expect(
+      detectProductType({
+        name: 'Athena Owl Etched Rocks Glass',
+      }).detectedType
+    ).toBe('Rocks Glass');
+    expect(
+      detectProductType({
+        name: 'Roman Legion 16oz Beer Can Glass',
+      }).detectedType
+    ).toBe('Beer Can Glass');
+    expect(
+      detectProductType({
+        name: 'Artemis Silver Moon Spiral Journal',
+      }).detectedType
+    ).toBe('Journal');
+    expect(
+      detectProductType({
+        name: 'Marcus Aurelius Stoic Hardcover Notebook',
+      }).detectedType
+    ).toBe('Notebook');
+    expect(
+      detectProductType({
+        name: 'Hermes Caduceus Messenger Tote Bag',
+      }).detectedType
+    ).toBe('Tote Bag');
+    expect(
+      detectProductType({
+        name: 'World War II Theater Map Desk Mat',
+      }).detectedType
+    ).toBe('Desk Mat');
+    expect(
+      detectProductType({
+        name: 'Classical Library Padded Laptop Sleeve',
+      }).detectedType
+    ).toBe('Laptop Sleeve');
+    expect(
+      detectProductType({
+        name: 'SPQR Crest Ergonomic Mouse Pad',
+      }).detectedType
+    ).toBe('Mouse Pad');
+    expect(
+      detectProductType({
+        name: 'Spartan Shield MagSafe iPhone Case',
+      }).detectedType
+    ).toBe('iPhone Case');
+    expect(
+      detectProductType({
+        name: 'Roman Republic Embroidered Dad Cap',
+      }).detectedType
+    ).toBe('Cap');
+
+    // URL slug inference when title is generic
+    expect(
+      detectProductType({
+        name: 'The Original Hottake 1943 Edition',
+        productUrl: 'https://scienceofgifts.com/products/the-original-hottake-1943-t-shirt',
+      })
+    ).toMatchObject({
+      detectedType: 'T-Shirt',
+      isConfident: true,
+      matchedSource: 'url_slug',
+    });
+  });
+
+  it('4. handles ambiguous or unrecognized products carefully without false-positive classification', () => {
+    // Generic "glass" must NOT be classified as Rocks Glass, Beer Can Glass, or Whiskey Glass
+    const ambiguousGlass = detectProductType({
+      name: 'Ancient Roman Blown Glass Artifact Replica',
+      productUrl: '/products/ancient-roman-blown-glass-replica',
+      shortDescription: 'Handcrafted decorative glass keepsake.',
+    });
+    expect(ambiguousGlass.isConfident).toBe(false);
+    expect(ambiguousGlass.detectedType).toBe('Other');
+
+    const unrecognizedItem = detectProductType({
+      name: 'Julius Caesar Bronze Desk Bust',
+      productUrl: '/products/julius-caesar-bronze-desk-bust',
+    });
+    expect(unrecognizedItem.isConfident).toBe(false);
+    expect(unrecognizedItem.detectedType).toBe('Other');
+  });
+
+  it('5, 6, 7 & 8. applies detection during HTML/CSV import, preserves manual overrides across storage & URL refreshes, and migrates older records safely', () => {
+    const store = new Map<string, string>();
+    const prevWindow = (globalThis as any).window;
+    (globalThis as any).window = {
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => store.set(k, v),
+        removeItem: (k: string) => store.delete(k),
+      },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => true,
+    };
+
+    try {
+      // 3. Apply detection during HTML product import
+      const extracted = extractProductFromHtml(
+        `<html><head>
+          <meta property="og:title" content="Abraham Lincoln Superhero Hoodie" />
+          <meta property="product:price:amount" content="49.90" />
+        </head><body></body></html>`,
+        'https://scienceofgifts.com/products/abraham-lincoln-superhero-hoodie'
+      );
+      expect(extracted.productType).toBe('Hoodie');
+
+      // CSV batch import infers productType when blank in CSV
+      const csvReport = parseProductImportBatch(
+        `name,productUrl,price,productType,category
+WWII Buff Mug,/products/wwii-buff-mug,$18.90,,World War II`
+      );
+      expect(csvReport.validProducts.length).toBe(1);
+      expect(csvReport.validProducts[0].productType).toBe('Mug');
+      expect(csvReport.validProducts[0].category).toBe('World War II');
+
+      // 5 & 6. Manual override persists across save & reload
+      const manuallyOverriddenProduct: Product = {
+        id: 'prod-lincoln-custom',
+        ownerId: 'local-preview',
+        name: 'Abraham Lincoln Superhero Hoodie',
+        productUrl: 'https://scienceofgifts.com/products/abraham-lincoln-superhero-hoodie',
+        imageUrl: '',
+        price: '$49.90',
+        currency: 'USD',
+        productType: 'Sweatshirt', // Manually overridden by user from Hoodie -> Sweatshirt
+        productTypeManualOverride: true,
+        category: 'American History',
+        tags: ['lincoln'],
+        shortDescription: 'Heavyweight fleece.',
+        featuresSpecs: '9.4 oz cotton-poly',
+        sourceNotes: 'User note',
+        archived: false,
+      };
+
+      saveLocalCatalogProducts([manuallyOverriddenProduct]);
+      const reloadedCatalog = loadLocalCatalogProducts()!;
+      expect(reloadedCatalog.length).toBe(1);
+      expect(reloadedCatalog[0].productType).toBe('Sweatshirt');
+      expect(reloadedCatalog[0].productTypeManualOverride).toBe(true);
+      expect(reloadedCatalog[0].category).toBe('American History');
+
+      // 7. Refreshing imported product data does NOT overwrite a manual override or confirmed category
+      const refreshResult = mergeRefreshedProductData(manuallyOverriddenProduct, {
+        ...extracted,
+        price: '$52.00',
+        productType: 'Hoodie',
+        category: 'General',
+      });
+      expect(refreshResult.mergedProduct.productType).toBe('Sweatshirt');
+      expect(refreshResult.mergedProduct.productTypeManualOverride).toBe(true);
+      expect(refreshResult.mergedProduct.category).toBe('American History');
+      expect(refreshResult.mergedProduct.price).toBe('$52.00');
+      expect(refreshResult.preservedFields).toContain('Product Type');
+      expect(refreshResult.preservedFields).toContain('Category');
+
+      // 8. Migration of older product records preserves existing categories & custom types, and populates missing types
+      const legacyMissingTypeProduct: Product = {
+        ...manuallyOverriddenProduct,
+        id: 'prod-legacy-no-type',
+        name: 'The Original Hottake 1943 T-Shirt',
+        productUrl: '/products/the-original-hottake-1943-t-shirt',
+        productType: '',
+        productTypeManualOverride: undefined,
+        category: 'Hades', // Uncataloged legacy category
+      };
+
+      const hydrated = migrateAndHydrateProductRecord(
+        legacyMissingTypeProduct,
+        INITIAL_PRODUCT_CATEGORIES
+      );
+      expect(hydrated.category).toBe('Hades'); // Preserved!
+      expect(hydrated.productType).toBe('T-Shirt'); // Suggested type populated!
+
+      const uncataloged = getUncatalogedProductCategories([hydrated], INITIAL_PRODUCT_CATEGORIES);
+      expect(uncataloged).toContain('Hades');
+    } finally {
+      (globalThis as any).window = prevWindow;
+    }
   });
 });
 

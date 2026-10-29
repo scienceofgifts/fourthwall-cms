@@ -29,6 +29,7 @@ export interface Product {
   originalPrice?: string;
   currency: string;
   productType: string;
+  productTypeManualOverride?: boolean;
   category: string;
   sku?: string;
   tags: string[];
