@@ -97,6 +97,11 @@ import {
   getSavedGeminiModelPreference,
   saveGeminiModelPreference,
 } from '../services/geminiModelConfig';
+import {
+  EditorialRichTextModal,
+  EditorialFieldKey,
+} from './EditorialRichTextModal';
+import { sanitizeEditorialRichHtml } from '../services/editorialRichText';
 
 interface HtmlEditorWorkspaceProps {
   products: Product[];
@@ -441,6 +446,16 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
       currentValuePreview: string;
     }>;
     modelMetadata?: GeminiExecutionMetadata;
+  } | null>(null);
+
+  // Active Rich-Text Modal target for Dek, Editorial Copy, and Specs Callout
+  const [activeRichTextTarget, setActiveRichTextTarget] = useState<{
+    sectionId: string;
+    nodePath: string;
+    fieldKey: EditorialFieldKey;
+    cardTitle?: string;
+    initialValue: string;
+    isParagraphContainer?: boolean;
   } | null>(null);
 
   // Sync rawEditorBuffer when currentHtml changes from visual edits
@@ -880,6 +895,46 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
       commitUpdatedProjectState(updatedProj, description, options);
     },
     [buildCurrentWorkspaceProjectSnapshot, commitUpdatedProjectState, products, sections]
+  );
+
+  // Saves rich-text edits back into the section HTML AST as inner HTML
+  const handleSaveRichText = useCallback(
+    (newHtml: string, plainText: string) => {
+      if (!activeRichTextTarget) return;
+      const { sectionId, nodePath, fieldKey, isParagraphContainer } = activeRichTextTarget;
+
+      let finalHtml = newHtml.trim();
+      if (fieldKey === 'dek') {
+        // Dek is already inside <p class="sog-ed-dek">; strip any outer <p> tag wrapper
+        finalHtml = finalHtml.replace(/^\s*<p\b[^>]*>(.*?)<\/p>\s*$/is, '$1').trim();
+      } else if (fieldKey === 'description' && isParagraphContainer === false) {
+        // Single <p class="sog-card-desc"> container; strip single outer paragraph wrapper
+        finalHtml = finalHtml.replace(/^\s*<p\b[^>]*>(.*?)<\/p>\s*$/is, '$1').trim();
+      }
+
+      applySectionHtmlMutation(
+        sectionId,
+        (secHtml) =>
+          updateHtmlNodeText(secHtml, nodePath, finalHtml, {
+            asRawInnerHtml: true,
+          }),
+        `Updated ${
+          fieldKey === 'dek'
+            ? 'subheadline / dek'
+            : fieldKey === 'specsCallout'
+            ? 'specifications'
+            : 'editorial copy'
+        }`
+      );
+
+      const fieldLabels: Record<EditorialFieldKey, string> = {
+        dek: 'Subheadline / Dek',
+        description: 'Editorial Copy',
+        specsCallout: 'Specifications Callout',
+      };
+      onShowToast?.(`Updated ${fieldLabels[fieldKey]}.`);
+    },
+    [activeRichTextTarget, applySectionHtmlMutation, onShowToast]
   );
 
   // Request to open another project (checks for unsaved changes or failed save first)
@@ -1872,122 +1927,235 @@ ${safePreviewBodyHtml}
             </>
           )}
 
-          {/* Dek */}
+          {/* Dek / Subheadline */}
           {card.fields.dek && (
             <div className="md:col-span-12">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between mb-1">
                 <label className="sog-label mb-0">Subheadline / Dek</label>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setAiAssistTarget({
-                      sectionId: parentSectionId,
-                      nodePath: card.fields.dek!.nodePath,
-                      fieldLabel: 'Card Dek / Subheadline',
-                      currentText: card.fields.dek!.value,
-                      instruction:
-                        'Tighten this 1-sentence dek while keeping all product facts accurate.',
-                      loading: false,
-                      error: null,
-                      proposedText: null,
-                      alternatives: [],
-                      notes: '',
-                    })
-                  }
-                  className="text-[11px] font-semibold text-[#123E59] hover:underline inline-flex items-center gap-1"
-                >
-                  <Sparkles className="w-3 h-3" />
-                  <span>AI Rewrite Dek</span>
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAiAssistTarget({
+                        sectionId: parentSectionId,
+                        nodePath: card.fields.dek!.nodePath,
+                        fieldLabel: 'Card Dek / Subheadline',
+                        currentText: card.fields.dek!.value,
+                        instruction:
+                          'Tighten this 1-sentence dek while keeping all product facts accurate.',
+                        loading: false,
+                        error: null,
+                        proposedText: null,
+                        alternatives: [],
+                        notes: '',
+                      })
+                    }
+                    className="text-[11px] font-semibold text-[#123E59] hover:underline inline-flex items-center gap-1"
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    <span>AI Rewrite Dek</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActiveRichTextTarget({
+                        sectionId: parentSectionId,
+                        nodePath: card.fields.dek!.nodePath,
+                        fieldKey: 'dek',
+                        cardTitle: card.fields.title?.value,
+                        initialValue: card.fields.dek!.htmlValue || card.fields.dek!.value || '',
+                      })
+                    }
+                    className="px-2.5 py-0.5 rounded bg-[#1A567B] hover:bg-[#123E59] text-white text-[11px] font-bold inline-flex items-center gap-1 shadow-2xs transition-colors"
+                    title="Open modal rich-text editor (Bold, Italics, Links)"
+                  >
+                    <Pencil className="w-3 h-3" />
+                    <span>Edit</span>
+                  </button>
+                </div>
               </div>
-              <input
-                type="text"
-                value={card.fields.dek.value}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  applySectionHtmlMutation(
-                    parentSectionId,
-                    (secHtml) => updateHtmlNodeText(secHtml, card.fields.dek!.nodePath, val),
-                    'Updated card dek'
-                  );
-                }}
-                className="sog-input mt-1"
-              />
+              <div
+                onClick={() =>
+                  setActiveRichTextTarget({
+                    sectionId: parentSectionId,
+                    nodePath: card.fields.dek!.nodePath,
+                    fieldKey: 'dek',
+                    cardTitle: card.fields.title?.value,
+                    initialValue: card.fields.dek!.htmlValue || card.fields.dek!.value || '',
+                  })
+                }
+                className="group relative bg-white border border-[#C8C0B0] hover:border-[#1A567B] rounded-md px-3 py-2 text-xs text-[#111A27] min-h-[38px] max-h-24 overflow-y-auto cursor-pointer transition-all shadow-2xs"
+                title="Click to edit with rich-text toolbar (Bold, Italics, Links)"
+              >
+                {card.fields.dek.htmlValue || card.fields.dek.value ? (
+                  <div
+                    className="font-serif leading-relaxed line-clamp-3 text-[#243346] [&_a]:text-[#1A567B] [&_a]:underline [&_strong]:font-bold [&_em]:italic"
+                    dangerouslySetInnerHTML={{
+                      __html: sanitizeEditorialRichHtml(
+                        card.fields.dek.htmlValue || card.fields.dek.value
+                      ),
+                    }}
+                  />
+                ) : (
+                  <span className="italic text-slate-400">
+                    No subheadline yet. Click Edit to add...
+                  </span>
+                )}
+                <div className="absolute right-2 bottom-1.5 opacity-0 group-hover:opacity-100 transition-opacity bg-white/95 px-1.5 py-0.5 rounded text-[10px] font-bold text-[#1A567B] border border-[#BCE0F0] pointer-events-none shadow-2xs">
+                  Click to Edit
+                </div>
+              </div>
             </div>
           )}
 
           {/* Description / Editorial Copy */}
           {card.fields.description && (
             <div className="md:col-span-12">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between mb-1">
                 <label className="sog-label mb-0">
                   {card.fields.description.isParagraphContainer
-                    ? 'Editorial Copy (Paragraphs separated by blank line)'
+                    ? 'Editorial Copy'
                     : 'Product Description'}
                 </label>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setAiAssistTarget({
-                      sectionId: parentSectionId,
-                      nodePath: card.fields.description!.nodePath,
-                      fieldLabel: 'Product Description / Editorial Copy',
-                      currentText: card.fields.description!.value,
-                      asParagraphs: card.fields.description!.isParagraphContainer,
-                      instruction:
-                        'Improve the editorial flow and sharpness of this product description without inventing any specs or prices.',
-                      loading: false,
-                      error: null,
-                      proposedText: null,
-                      alternatives: [],
-                      notes: '',
-                    })
-                  }
-                  className="text-[11px] font-semibold text-[#123E59] hover:underline inline-flex items-center gap-1"
-                >
-                  <Sparkles className="w-3 h-3" />
-                  <span>AI Improve Description</span>
-                </button>
-              </div>
-              <textarea
-                rows={card.fields.description.isParagraphContainer ? 5 : 2}
-                value={card.fields.description.value}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  applySectionHtmlMutation(
-                    parentSectionId,
-                    (secHtml) =>
-                      updateHtmlNodeText(secHtml, card.fields.description!.nodePath, val, {
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAiAssistTarget({
+                        sectionId: parentSectionId,
+                        nodePath: card.fields.description!.nodePath,
+                        fieldLabel: 'Product Description / Editorial Copy',
+                        currentText: card.fields.description!.value,
                         asParagraphs: card.fields.description!.isParagraphContainer,
-                      }),
-                    'Updated card description'
-                  );
-                }}
-                className="sog-input mt-1 leading-relaxed"
-              />
+                        instruction:
+                          'Improve the editorial flow and sharpness of this product description without inventing any specs or prices.',
+                        loading: false,
+                        error: null,
+                        proposedText: null,
+                        alternatives: [],
+                        notes: '',
+                      })
+                    }
+                    className="text-[11px] font-semibold text-[#123E59] hover:underline inline-flex items-center gap-1"
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    <span>AI Improve Description</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActiveRichTextTarget({
+                        sectionId: parentSectionId,
+                        nodePath: card.fields.description!.nodePath,
+                        fieldKey: 'description',
+                        cardTitle: card.fields.title?.value,
+                        initialValue:
+                          card.fields.description!.htmlValue || card.fields.description!.value || '',
+                        isParagraphContainer: card.fields.description!.isParagraphContainer,
+                      })
+                    }
+                    className="px-2.5 py-0.5 rounded bg-[#1A567B] hover:bg-[#123E59] text-white text-[11px] font-bold inline-flex items-center gap-1 shadow-2xs transition-colors"
+                    title="Open modal rich-text editor (Paragraphs, Bold, Italics, Lists, Links)"
+                  >
+                    <Pencil className="w-3 h-3" />
+                    <span>Edit</span>
+                  </button>
+                </div>
+              </div>
+              <div
+                onClick={() =>
+                  setActiveRichTextTarget({
+                    sectionId: parentSectionId,
+                    nodePath: card.fields.description!.nodePath,
+                    fieldKey: 'description',
+                    cardTitle: card.fields.title?.value,
+                    initialValue:
+                      card.fields.description!.htmlValue || card.fields.description!.value || '',
+                    isParagraphContainer: card.fields.description!.isParagraphContainer,
+                  })
+                }
+                className="group relative bg-white border border-[#C8C0B0] hover:border-[#1A567B] rounded-md px-3 py-2 text-xs text-[#111A27] min-h-[58px] max-h-32 overflow-y-auto cursor-pointer transition-all shadow-2xs"
+                title="Click to edit with rich-text toolbar (Bold, Italics, Links, Lists, Paragraphs)"
+              >
+                {card.fields.description.htmlValue || card.fields.description.value ? (
+                  <div
+                    className="font-serif leading-relaxed text-[#243346] [&_p]:mb-1.5 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5 [&_a]:text-[#1A567B] [&_a]:underline [&_strong]:font-bold [&_em]:italic"
+                    dangerouslySetInnerHTML={{
+                      __html: sanitizeEditorialRichHtml(
+                        card.fields.description.htmlValue || card.fields.description.value
+                      ),
+                    }}
+                  />
+                ) : (
+                  <span className="italic text-slate-400">
+                    No editorial copy yet. Click Edit to add...
+                  </span>
+                )}
+                <div className="absolute right-2 bottom-1.5 opacity-0 group-hover:opacity-100 transition-opacity bg-white/95 px-1.5 py-0.5 rounded text-[10px] font-bold text-[#1A567B] border border-[#BCE0F0] pointer-events-none shadow-2xs">
+                  Click to Edit
+                </div>
+              </div>
             </div>
           )}
 
           {/* Specs Callout */}
           {card.fields.specsCallout && (
             <div className="md:col-span-6">
-              <label className="sog-label">Specifications Callout</label>
-              <textarea
-                rows={2}
-                value={card.fields.specsCallout.value}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  applySectionHtmlMutation(
-                    parentSectionId,
-                    (secHtml) =>
-                      updateHtmlNodeText(secHtml, card.fields.specsCallout!.nodePath, val, {
-                        asParagraphs: card.fields.specsCallout!.isParagraphContainer,
-                      }),
-                    'Updated card specs'
-                  );
-                }}
-                className="sog-input"
-              />
+              <div className="flex items-center justify-between mb-1">
+                <label className="sog-label mb-0">Specifications Callout</label>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setActiveRichTextTarget({
+                      sectionId: parentSectionId,
+                      nodePath: card.fields.specsCallout!.nodePath,
+                      fieldKey: 'specsCallout',
+                      cardTitle: card.fields.title?.value,
+                      initialValue:
+                        card.fields.specsCallout!.htmlValue || card.fields.specsCallout!.value || '',
+                      isParagraphContainer: card.fields.specsCallout!.isParagraphContainer,
+                    })
+                  }
+                  className="px-2.5 py-0.5 rounded bg-[#1A567B] hover:bg-[#123E59] text-white text-[11px] font-bold inline-flex items-center gap-1 shadow-2xs transition-colors"
+                  title="Open modal rich-text editor (Bullets, Bold, Links)"
+                >
+                  <Pencil className="w-3 h-3" />
+                  <span>Edit</span>
+                </button>
+              </div>
+              <div
+                onClick={() =>
+                  setActiveRichTextTarget({
+                    sectionId: parentSectionId,
+                    nodePath: card.fields.specsCallout!.nodePath,
+                    fieldKey: 'specsCallout',
+                    cardTitle: card.fields.title?.value,
+                    initialValue:
+                      card.fields.specsCallout!.htmlValue || card.fields.specsCallout!.value || '',
+                    isParagraphContainer: card.fields.specsCallout!.isParagraphContainer,
+                  })
+                }
+                className="group relative bg-white border border-[#C8C0B0] hover:border-[#1A567B] rounded-md px-3 py-2 text-xs text-[#111A27] min-h-[42px] max-h-24 overflow-y-auto cursor-pointer transition-all shadow-2xs"
+                title="Click to edit specifications callout (Bullets, Bold, Links)"
+              >
+                {card.fields.specsCallout.htmlValue || card.fields.specsCallout.value ? (
+                  <div
+                    className="font-serif leading-relaxed text-[#243346] [&_p]:mb-1 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5 [&_a]:text-[#1A567B] [&_a]:underline [&_strong]:font-bold [&_em]:italic"
+                    dangerouslySetInnerHTML={{
+                      __html: sanitizeEditorialRichHtml(
+                        card.fields.specsCallout!.htmlValue || card.fields.specsCallout!.value
+                      ),
+                    }}
+                  />
+                ) : (
+                  <span className="italic text-slate-400">
+                    No specifications yet. Click Edit to add...
+                  </span>
+                )}
+                <div className="absolute right-2 bottom-1.5 opacity-0 group-hover:opacity-100 transition-opacity bg-white/95 px-1.5 py-0.5 rounded text-[10px] font-bold text-[#1A567B] border border-[#BCE0F0] pointer-events-none shadow-2xs">
+                  Click to Edit
+                </div>
+              </div>
             </div>
           )}
 
@@ -5469,6 +5637,20 @@ ${safePreviewBodyHtml}
             </div>
           </div>
         </div>
+      )}
+
+      {/* MODAL 7: EDITORIAL RICH-TEXT MODAL */}
+      {activeRichTextTarget && (
+        <EditorialRichTextModal
+          isOpen={Boolean(activeRichTextTarget)}
+          fieldKey={activeRichTextTarget.fieldKey}
+          cardTitle={activeRichTextTarget.cardTitle}
+          initialValue={activeRichTextTarget.initialValue}
+          onSave={(newHtml, plainText) => {
+            handleSaveRichText(newHtml, plainText);
+          }}
+          onClose={() => setActiveRichTextTarget(null)}
+        />
       )}
     </div>
   );

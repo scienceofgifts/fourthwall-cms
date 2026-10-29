@@ -85,6 +85,13 @@ import {
   renameManagedCategory,
 } from './services/productCatalogTaxonomy';
 import {
+  countWords,
+  ensureParagraphsHtml,
+  extractPlainTextFromHtml,
+  isSafeUrl,
+  sanitizeEditorialRichHtml,
+} from './services/editorialRichText';
+import {
   DEFAULT_GEMINI_MODEL_ID,
   GEMINI_MODEL_DEFINITIONS,
   GeminiFallbackError,
@@ -2407,6 +2414,183 @@ WWII Buff Mug,/products/wwii-buff-mug,$18.90,,World War II`
     } finally {
       (globalThis as any).window = prevWindow;
     }
+  });
+});
+
+describe('Feature 8: Modal Rich-Text Editor for First Three Editorial Fields (Subheadline/Dek, Editorial Copy, Specifications Callout)', () => {
+  it('1. validates safe and unsafe hyperlinks correctly (rejects javascript, vbscript, data)', () => {
+    expect(isSafeUrl('https://scienceofgifts.com/products/iliad')).toBe(true);
+    expect(isSafeUrl('http://example.com')).toBe(true);
+    expect(isSafeUrl('mailto:curator@scienceofgifts.com')).toBe(true);
+    expect(isSafeUrl('#section-ancient-rome')).toBe(true);
+    expect(isSafeUrl('/products/achilles-mug')).toBe(true);
+
+    expect(isSafeUrl('javascript:alert(document.cookie)')).toBe(false);
+    expect(isSafeUrl('JAVASCRIPT:void(0)')).toBe(false);
+    expect(isSafeUrl('vbscript:msgbox("test")')).toBe(false);
+    expect(isSafeUrl('data:text/html,<script>alert(1)</script>')).toBe(false);
+    expect(isSafeUrl('')).toBe(false);
+    expect(isSafeUrl(null)).toBe(false);
+  });
+
+  it('2. sanitizes rich editorial HTML: strips dangerous scripts, iframes, inline event handlers while preserving safe formatting and external link rel', () => {
+    const malicious = `
+      <p>A <strong>magnificent</strong> gift guide pick with <script>alert("xss")</script> and <iframe src="//evil.com"></iframe>.</p>
+      <p>Check this <a href="https://fourthwall.com/science-of-gifts" onclick="malicious()" target="_blank">curated store</a> and an unsafe <a href="javascript:doBadThings()">bad link</a>.</p>
+      <b>Bold text</b> and <i>italic text</i>.
+    `;
+    const sanitized = sanitizeEditorialRichHtml(malicious);
+
+    expect(sanitized).not.toContain('<script');
+    expect(sanitized).not.toContain('<iframe');
+    expect(sanitized).not.toContain('onclick');
+    expect(sanitized).not.toContain('javascript:');
+
+    // Normalizes <b> to <strong> and <i> to <em>
+    expect(sanitized).toContain('<strong>magnificent</strong>');
+    expect(sanitized).toContain('<strong>Bold text</strong>');
+    expect(sanitized).toContain('<em>italic text</em>');
+
+    // External link has target="_blank" and rel="noopener noreferrer"
+    expect(sanitized).toContain('rel="noopener noreferrer"');
+    expect(sanitized).toContain('href="https://fourthwall.com/science-of-gifts"');
+  });
+
+  it('3. extracts plain text and counts words accurately from formatted HTML', () => {
+    const richSnippet = '<p>The <strong>ultimate</strong> companion for <em>history teachers</em>.</p><ul><li>100% Linen</li><li>Made in Greece</li></ul>';
+    const plain = extractPlainTextFromHtml(richSnippet);
+    expect(plain).toBe('The ultimate companion for history teachers.\n\n100% Linen\nMade in Greece');
+    expect(countWords(richSnippet)).toBe(11);
+  });
+
+  it('4. converts unformatted multi-line text into standard HTML paragraphs and leaves rich HTML intact', () => {
+    const plain = 'First paragraph.\n\nSecond paragraph with notes.';
+    const paragraphs = ensureParagraphsHtml(plain);
+    expect(paragraphs).toContain('<p>First paragraph.</p>');
+    expect(paragraphs).toContain('<p>Second paragraph with notes.</p>');
+
+    const alreadyRich = '<p>Already formatted paragraph.</p>';
+    expect(ensureParagraphsHtml(alreadyRich)).toBe('<p>Already formatted paragraph.</p>');
+  });
+
+  it('5. extracts htmlValue on dek, description, and specsCallout during AST analysis', () => {
+    const sampleCardHtml = `
+      <article class="sog-ed-card">
+        <div class="sog-ed-media">
+          <a href="https://example.com/p1"><span class="sog-ed-num">#01</span><img src="/img.jpg" alt="Item" /></a>
+        </div>
+        <div class="sog-ed-content">
+          <h3 class="sog-ed-title"><a href="https://example.com/p1">The History Atlas</a></h3>
+          <p class="sog-ed-dek">A <strong>visually stunning</strong> chronicle with <a href="https://example.com">historical charts</a>.</p>
+          <div class="sog-ed-copy">
+            <p>First paragraph detailing the map fidelity and rich binding.</p>
+            <p>Second paragraph praising the <em>curated footnotes</em>.</p>
+          </div>
+          <div class="sog-ed-specs">
+            <p>• Hardcover foil embossed</p>
+            <p>• 480 pages, archival paper</p>
+          </div>
+          <div class="sog-ed-footer">
+            <span class="sog-ed-tags">Best for: Cartography lovers</span>
+            <a href="https://example.com/p1" class="sog-ed-cta">Shop Gift →</a>
+          </div>
+        </div>
+      </article>
+    `;
+
+    const report = analyzeHtmlDocument(sampleCardHtml, SEED_PRODUCTS);
+    const card = report.blocks[0].productCards[0];
+    expect(card).toBeDefined();
+
+    // Plain text values are extracted
+    expect(card.fields.dek?.value).toBe('A visually stunning chronicle with historical charts.');
+    expect(card.fields.description?.value).toContain('First paragraph detailing the map fidelity');
+    expect(card.fields.specsCallout?.value).toContain('Hardcover foil embossed');
+
+    // Rich inner HTML is captured
+    expect(card.fields.dek?.htmlValue).toContain('<strong>visually stunning</strong>');
+    expect(card.fields.dek?.htmlValue).toContain('<a href="https://example.com">historical charts</a>');
+    expect(card.fields.description?.htmlValue).toContain('<p>First paragraph detailing');
+    expect(card.fields.description?.htmlValue).toContain('<em>curated footnotes</em>');
+    expect(card.fields.specsCallout?.htmlValue).toContain('<p>• Hardcover foil embossed</p>');
+  });
+
+  it('6. updates dek, description, and specsCallout AST nodes with rich HTML without altering sibling nodes', () => {
+    const cardHtml = `
+      <article class="sog-ed-card">
+        <h3 class="sog-ed-title">Atlas</h3>
+        <p class="sog-ed-dek">Old plain dek</p>
+        <div class="sog-ed-copy"><p>Old copy</p></div>
+        <div class="sog-ed-specs"><p>Old specs</p></div>
+      </article>
+    `;
+
+    const initialReport = analyzeHtmlDocument(cardHtml, SEED_PRODUCTS);
+    const card = initialReport.blocks[0].productCards[0];
+
+    // 1. Update Dek with formatted HTML
+    const updatedWithRichDek = updateHtmlNodeText(
+      cardHtml,
+      card.fields.dek!.nodePath,
+      'A <strong>monumental</strong> work with <a href="https://maps.example.com">fine engravings</a>',
+      { asRawInnerHtml: true }
+    );
+    expect(updatedWithRichDek).toContain('<p class="sog-ed-dek">A <strong>monumental</strong> work with <a href="https://maps.example.com">fine engravings</a></p>');
+    expect(updatedWithRichDek).toContain('<h3 class="sog-ed-title">Atlas</h3>'); // Sibling preserved!
+
+    // 2. Update Description with multiple paragraphs and lists
+    const updatedDescReport = analyzeHtmlDocument(updatedWithRichDek, SEED_PRODUCTS);
+    const card2 = updatedDescReport.blocks[0].productCards[0];
+
+    const richCopy = '<p>Paragraph 1 with <em>emphasis</em>.</p><ul><li>Feature A</li><li>Feature B</li></ul>';
+    const updatedWithRichCopy = updateHtmlNodeText(
+      updatedWithRichDek,
+      card2.fields.description!.nodePath,
+      richCopy,
+      { asRawInnerHtml: true }
+    );
+    expect(updatedWithRichCopy).toContain('<div class="sog-ed-copy"><p>Paragraph 1 with <em>emphasis</em>.</p><ul><li>Feature A</li><li>Feature B</li></ul></div>');
+    expect(updatedWithRichCopy).toContain('<strong>monumental</strong>'); // Dek preserved!
+
+    // 3. Update Specs with formatted bullets
+    const updatedSpecsReport = analyzeHtmlDocument(updatedWithRichCopy, SEED_PRODUCTS);
+    const card3 = updatedSpecsReport.blocks[0].productCards[0];
+
+    const richSpecs = '<p>• <strong>Material:</strong> 100% Cotton</p><p>• <strong>Origin:</strong> USA</p>';
+    const finalHtml = updateHtmlNodeText(
+      updatedWithRichCopy,
+      card3.fields.specsCallout!.nodePath,
+      richSpecs,
+      { asRawInnerHtml: true }
+    );
+    expect(finalHtml).toContain('<div class="sog-ed-specs"><p>• <strong>Material:</strong> 100% Cotton</p><p>• <strong>Origin:</strong> USA</p></div>');
+  });
+
+  it('7. renders editorial_list in htmlRenderer with rich markup intact and safely sanitized', () => {
+    const mockSection: GuideSection = {
+      id: 'sec-editorial-test',
+      guideId: 'guide-test',
+      type: 'editorial_list',
+      title: 'History Essentials',
+      order: 1,
+      config: {
+        editorialItems: [
+          {
+            order: 1,
+            productId: 'prod-atlas',
+            displayTitle: 'The Classical Atlas',
+            dek: 'A <strong>gorgeous</strong> edition with <a href="https://example.com">ancient maps</a>.',
+            editorialCopy: '<p>Every map was hand-restored.</p><p>Includes <em>marginalia</em>.</p>',
+            specsCallout: '<p>• <strong>Binding:</strong> Leatherette</p>',
+          },
+        ],
+      },
+    };
+
+    const rendered = renderSectionHtml(mockSection, SEED_PRODUCTS, { forPreview: false });
+    expect(rendered).toContain('<p class="sog-ed-dek">A <strong>gorgeous</strong> edition with <a href="https://example.com">ancient maps</a>.</p>');
+    expect(rendered).toContain('<div class="sog-ed-copy">\n<p>Every map was hand-restored.</p><p>Includes <em>marginalia</em>.</p>\n        </div>');
+    expect(rendered).toContain('<strong>Binding:</strong> Leatherette');
   });
 });
 

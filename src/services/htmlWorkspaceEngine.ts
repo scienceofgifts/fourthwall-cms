@@ -577,15 +577,17 @@ export interface RecognizedProductCard {
       noteNodePath?: string;
       noteValue?: string;
     };
-    dek?: { nodePath: string; value: string };
+    dek?: { nodePath: string; value: string; htmlValue?: string };
     description?: {
       nodePath: string;
       value: string;
+      htmlValue?: string;
       isParagraphContainer?: boolean;
     };
     specsCallout?: {
       nodePath: string;
       value: string;
+      htmlValue?: string;
       isParagraphContainer?: boolean;
     };
     tagsText?: { nodePath: string; value: string };
@@ -973,6 +975,7 @@ function analyzeProductCardNode(
     fields.dek = {
       nodePath: dekNode.path,
       value: getPlainText(dekNode).trim(),
+      htmlValue: getInnerHtml(dekNode),
     };
   }
 
@@ -989,6 +992,7 @@ function analyzeProductCardNode(
     fields.description = {
       nodePath: copyContainer.path,
       value: paragraphsText,
+      htmlValue: getInnerHtml(copyContainer),
       isParagraphContainer: true,
     };
   } else {
@@ -1010,6 +1014,7 @@ function analyzeProductCardNode(
       fields.description = {
         nodePath: descNode.path,
         value: getPlainText(descNode).trim(),
+        htmlValue: getInnerHtml(descNode),
         isParagraphContainer: false,
       };
     }
@@ -1028,6 +1033,7 @@ function analyzeProductCardNode(
     fields.specsCallout = {
       nodePath: specsNode.path,
       value: specsText,
+      htmlValue: getInnerHtml(specsNode),
       isParagraphContainer: pChildren.length > 0,
     };
   }

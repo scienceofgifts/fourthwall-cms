@@ -302,28 +302,42 @@ ${cardsHtml}
           const price = (item.priceDisplay || product?.price || '').trim();
           const priceNote = (item.priceNote || '').trim();
           const dek = (item.dek || product?.shortDescription || '').trim();
+          const dekHtml = /<[a-z][\s\S]*>/i.test(dek) ? sanitizeEditorialHtml(dek) : escapeHtml(dek);
+
           const rawCopy = (item.editorialCopy || '').trim();
-          const paragraphs = rawCopy
-            ? rawCopy
-                .split(/\n\s*\n/)
-                .map((p) => p.trim())
-                .filter(Boolean)
-            : [];
-          const copyHtml = paragraphs.map((p) => `          <p>${escapeHtml(p)}</p>`).join('\n');
+          let copyHtml = '';
+          if (/<[a-z][\s\S]*>/i.test(rawCopy)) {
+            // Already contains rich HTML tags; if it does not contain <p>, wrap it
+            copyHtml = /<p\b/i.test(rawCopy)
+              ? sanitizeEditorialHtml(rawCopy)
+              : `          <p>${sanitizeEditorialHtml(rawCopy)}</p>`;
+          } else {
+            const paragraphs = rawCopy
+              ? rawCopy
+                  .split(/\n\s*\n/)
+                  .map((p) => p.trim())
+                  .filter(Boolean)
+              : [];
+            copyHtml = paragraphs.map((p) => `          <p>${escapeHtml(p)}</p>`).join('\n');
+          }
 
           const rawSpecs = (item.specsCallout || product?.featuresSpecs || '').trim();
-          const specLines = rawSpecs
-            ? rawSpecs
+          let specsBlock = '';
+          if (rawSpecs) {
+            if (/<[a-z][\s\S]*>/i.test(rawSpecs)) {
+              specsBlock = `        <div class="sog-ed-specs">\n          ${sanitizeEditorialHtml(rawSpecs)}\n        </div>\n`;
+            } else {
+              const specLines = rawSpecs
                 .split(/\n/)
                 .map((s) => s.trim())
-                .filter(Boolean)
-            : [];
-          const specsBlock =
-            specLines.length > 0
-              ? `        <div class="sog-ed-specs">\n${specLines
+                .filter(Boolean);
+              if (specLines.length > 0) {
+                specsBlock = `        <div class="sog-ed-specs">\n${specLines
                   .map((line) => `          <p>${escapeHtml(line)}</p>`)
-                  .join('\n')}\n        </div>\n`
-              : '';
+                  .join('\n')}\n        </div>\n`;
+              }
+            }
+          }
 
           const tagsText =
             (item.tagsText || '').trim() ||
@@ -351,7 +365,7 @@ ${cardsHtml}
         <h3 class="sog-ed-title">
           <a href="${escapeHtml(url)}">${escapeHtml(title)}</a>
         </h3>
-        <p class="sog-ed-dek">${escapeHtml(dek)}</p>
+        <p class="sog-ed-dek">${dekHtml}</p>
         <div class="sog-ed-copy">
 ${copyHtml}
         </div>
