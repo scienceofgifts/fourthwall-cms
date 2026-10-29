@@ -1,0 +1,742 @@
+# Build a Production-Ready Gift Guide CMS for Fourthwall
+
+## 1. Your Role and Objective
+
+Act as a senior full-stack engineer, product designer, and application architect. Build a complete, functional web application in Google AI Studio.
+
+The application is a reusable, cloud-backed **Gift Guide CMS and HTML Template Engine** for my Fourthwall shop, Science of Gifts.
+
+My Fourthwall pages have limited layout customization options. I have already designed a sophisticated editorial-style gift guide using custom HTML and CSS. The CSS is installed in the site's header and is already working. I do not want to rebuild, redesign, or modify that CSS.
+
+The purpose of this application is to generate, manage, preview, and export the HTML content that goes inside separate custom-code blocks on Fourthwall pages.
+
+I will reuse this application for many different gift-guide topics, including Greek mythology, history, historical eras, and other interest-based gift guides.
+
+**This must be a working application, not a static mockup or a prototype with nonfunctional buttons.** Build the actual data persistence, editing, AI generation, HTML rendering, export, and schema generation functionality.
+
+Before writing code, inspect the provided reference materials and the existing project. If this is an existing application, preserve its working functionality and integrate the new functionality rather than replacing unrelated code.
+
+## 2. Reference Materials and Non-Negotiable Constraints
+
+Use the supplied handover document as the reference for the existing HTML structure, CSS classes, product examples, page sections, and JSON-LD schema.
+
+The handover document contains:
+
+- The complete locked CSS stylesheet.
+- The existing Greek mythology gift-guide HTML structure.
+- The Quick Picks and Editor's Pick components.
+- The long-form editorial product card.
+- The secondary product grids.
+- The category/deity hub.
+- The buying guide and FAQ sections.
+- A sample unified JSON-LD `@graph` containing `BreadcrumbList`, `ItemList`, and `FAQPage`.
+
+Treat this reference as the design and structural contract.
+
+Requirements:
+
+1. Do not rewrite or replace the existing stylesheet.
+2. Do not invent a new set of HTML classes when matching classes already exist.
+3. Reproduce the provided HTML structure accurately.
+4. Keep the output compatible with Fourthwall's custom-code blocks.
+5. Keep each HTML section independently exportable.
+6. Generate the schema as a separate, standalone export.
+7. Do not introduce unnecessary JavaScript dependencies into the exported Fourthwall HTML.
+8. Do not change the visual design of the exported storefront merely to make the CMS easier to implement.
+
+The CMS interface itself can have its own design system. It should be visually attractive and pleasant to use.
+
+If any reference material is missing from the project, identify that gap rather than silently inventing a replacement.
+
+## 3. Technology and Architecture
+
+Use the existing project's framework and tooling if already configured. Otherwise, use a modern React and TypeScript application with a clean component architecture.
+
+Use Firebase for cloud persistence:
+
+- Firebase Authentication for user authentication.
+- Cloud Firestore for saved projects, product records, guide content, and relevant configuration.
+- Firebase Security Rules to enforce authenticated, authorized access to user data.
+- The Google AI Studio-supported AI integration for optional AI-assisted content generation.
+
+Do not hardcode Firebase credentials, API keys, or secrets. Use the appropriate environment configuration and supported SDK integrations. Never expose privileged service-account credentials in client-side code.
+
+If Firebase has not been configured, create the necessary configuration interface and document the exact setup steps. Do not pretend cloud persistence is working when the project has not been connected to Firebase.
+
+Use a modular architecture with distinct responsibilities:
+
+1. Application shell and navigation.
+2. Firebase authentication and persistence.
+3. Product library.
+4. Gift-guide project management.
+5. Section and content editor.
+6. AI generation services.
+7. HTML template renderer.
+8. Live preview.
+9. HTML export.
+10. JSON-LD schema generator and validator.
+
+Keep the rendering engine deterministic. The same saved guide data and template configuration should produce the same HTML, except for explicitly configured timestamps or other intentional dynamic values.
+
+## 4. Visual Design and User Experience
+
+Build an application that feels like a polished creative workspace rather than a generic admin dashboard.
+
+### Design direction
+
+Use a sophisticated editorial aesthetic with:
+
+- Warm off-white or ivory surfaces.
+- Restrained powder-blue and mint accents.
+- Dark navy or charcoal typography.
+- Elegant serif headings paired with clean sans-serif interface text.
+- Refined borders, subtle shadows, generous spacing, and well-designed empty states.
+- Attractive product thumbnails and readable metadata.
+- Clear hierarchy, compact controls where appropriate, and useful visual feedback.
+
+The interface should feel cohesive, distinctive, and enjoyable to use without sacrificing efficiency.
+
+Avoid generic dashboard styling, excessive gradients, excessive rounded cards, oversized empty spaces, and decorative elements that interfere with the work.
+
+### Main navigation
+
+Provide a clear application navigation structure, including:
+
+- Dashboard / My Gift Guides
+- Product Library
+- Guide Editor
+- Templates or reusable configurations, where appropriate
+- Export and Schema tools
+- Settings and Firebase connection status
+
+The primary workflow should remain easy to understand. Avoid hiding essential operations in nested menus.
+
+### Dashboard
+
+Display saved gift-guide projects as attractive project cards or rows.
+
+Each project should show relevant metadata, such as:
+
+- Guide title.
+- Topic or category.
+- Last updated time.
+- Number of products.
+- Number of configured sections.
+- Save/sync status.
+
+Include actions to create, open, duplicate, and delete projects. Deletion must require confirmation.
+
+Include useful empty states for a new account and a clear way to create the first guide.
+
+### Editor layout
+
+Use a visual editor with three functional areas when screen space allows:
+
+- A section navigator on the left.
+- A content editing panel in the center.
+- A live preview or preview toggle on the right.
+
+Allow the user to collapse panels, switch between editing and preview, and work comfortably on smaller screens.
+
+The interface must be responsive, although desktop is the primary editing environment.
+
+## 5. Product Library and Product Roster
+
+Build a central product library so product information is entered once and reused across multiple gift guides and sections.
+
+### Product fields
+
+Support the following fields where applicable:
+
+- Stable product ID.
+- Product name.
+- Product URL.
+- Product image URL.
+- Price.
+- Currency.
+- Product type.
+- Category and tags.
+- Short description.
+- Product features and verified specifications.
+- Optional source notes.
+- Creation and modification timestamps.
+
+Allow users to create, edit, search, filter, and archive product records.
+
+Provide practical import methods, including:
+
+- Paste a list of products.
+- Import CSV data.
+- Add or edit individual products manually.
+
+Validate URLs and prices where appropriate. Preserve original URLs and avoid silently changing product slugs.
+
+For imported data, report invalid rows and missing fields clearly. Allow valid rows to be imported without discarding the entire batch.
+
+Do not assume that an AI model can reliably scrape all Fourthwall product pages. Treat user-supplied product data as the source of truth.
+
+### Product reuse
+
+A product may appear in multiple sections of one guide or in several different guides.
+
+Editing a shared product record should not silently overwrite guide-specific editorial copy.
+
+Keep the distinction between:
+
+- Canonical product information.
+- Guide-specific presentation data.
+- Section-specific display settings.
+
+For example, a product may have a canonical name and price but use a shorter display title, different editorial description, or different badge in a particular gift guide.
+
+Where possible, use stable product IDs rather than duplicated product objects.
+
+## 6. Gift-Guide Project Management and Persistent Storage
+
+Every gift guide must be a persistent, independently editable cloud project.
+
+Examples:
+
+- Greek Mythology Gifts.
+- Gifts for History Lovers.
+- Roman History Gifts.
+- World War II Gifts.
+
+Creating one guide must not overwrite another.
+
+### Saving and reopening
+
+The user must be able to:
+
+1. Create a guide.
+2. Add products and configure sections.
+3. Save the guide.
+4. Leave the application.
+5. Return later and reopen the guide with all saved content intact.
+6. Add new products or edit existing ones.
+7. Preview and export the updated sections.
+
+Persist all relevant data, including section order, product assignments, editorial copy, category configurations, FAQ content, schema settings, and manual edits.
+
+Use explicit save feedback and a sensible autosave strategy, with a visible saved/saving/error status.
+
+Handle concurrent edits and failed network requests safely. Do not report that data is saved until the write succeeds. Avoid overwriting newer server data with stale client state.
+
+Support recovery from interrupted editing where practical.
+
+### Backup and restore
+
+Include JSON export and import for project backup and recovery.
+
+The backup must preserve enough structured information to reconstruct the saved guide and its section configurations. Clearly distinguish a project backup from an HTML export.
+
+Validate imported backups and warn before replacing existing data.
+
+## 7. Reusable Guide Structure and Section Editor
+
+A gift guide consists of independently configurable sections.
+
+The system must support the following section types using the provided templates.
+
+### A. Quick Bookmarks
+
+Use the existing Table of Contents HTML structure.
+
+The current reference contains eight navigation entries. Support eight configurable entries by default, while keeping the configuration flexible enough to accommodate other guide structures when necessary.
+
+For every entry, allow editing of:
+
+- Visible label.
+- Anchor destination.
+- Order.
+- Optional icon or prefix text.
+- Enabled/disabled status.
+
+Generate matching anchors and navigation links. Validate duplicate IDs and missing destinations.
+
+### B. Quick Picks
+
+Use the existing four-card Quick Picks design as the default template.
+
+Allow the user to configure:
+
+- Product selection.
+- Badge text.
+- Display title.
+- Supporting description.
+- Price display.
+- Image and product link.
+- CTA label.
+- Card order.
+
+The number of cards must be configurable. Do not hardcode exactly four cards in the renderer.
+
+### C. Editor's Pick
+
+Use the existing dark Editor's Pick spotlight template.
+
+Allow the user to select a featured product and edit:
+
+- Kicker or badge.
+- Heading.
+- Description.
+- Displayed price.
+- CTA label.
+- Product URL and image.
+
+The section must be independently editable and exportable.
+
+### D. Main Editorial Sections
+
+This is the core of the application.
+
+Allow users to create any number of product sections and name them according to the guide.
+
+Examples:
+
+- Part 1: History T-Shirts.
+- Part 2: Hoodies and Sweatshirts.
+- Part 3: Books and Journals.
+- Ancient Rome.
+- World War II.
+- Medieval History.
+
+Each section should have configurable:
+
+- Section title.
+- Optional subtitle or introduction.
+- Chapter banner and kicker.
+- Product assignments.
+- Product ordering.
+- Editorial card copy.
+- Optional secondary product grids.
+- Section-specific template settings.
+
+Use the existing `sog-editorial-list`, `sog-ed-card`, and related classes for the long-form cards.
+
+The reference uses a 310px sticky-image editorial card with an image, title, badge, price, description, specifications, tags, and CTA. Preserve that structure.
+
+Allow the number of products to vary freely. A section may contain 3, 15, 20, 30, or more items. Do not hardcode a 14-product limit.
+
+Implement efficient product management for large lists, including search, selection, reordering, and clear visual grouping.
+
+### E. More Gifts Grids
+
+Use the existing secondary three-column product-grid template.
+
+Allow the user to add one or more grids within the relevant guide structure, select products, edit titles and descriptions, and control ordering.
+
+Support variable item counts. Use the existing responsive CSS classes.
+
+Prevent accidental duplication when moving products between sections, unless the user intentionally chooses to feature a product more than once.
+
+### F. Category Hub
+
+Use the existing deity hub as the structural reference, but make it topic-agnostic.
+
+Greek mythology may use Greek gods. A history guide may use historical eras, civilizations, conflicts, or themes.
+
+Allow the user to configure:
+
+- Hub heading and introduction.
+- Category name.
+- Subtitle.
+- Category image or selected product thumbnail.
+- Description.
+- Linked products.
+- Link labels.
+- Category order.
+
+Allow users to create, edit, reorder, and delete category cards.
+
+Do not hardcode Greek mythology or individual deities into the application's data model. The current Greek mythology implementation is a sample configuration, not a permanent limitation.
+
+### G. Buying Guide
+
+Use the existing buying-guide design.
+
+Support an editable introduction and configurable content pillars or blocks, each with its own heading, body copy, and contextual links.
+
+The number of blocks should be configurable rather than permanently limited to three.
+
+### H. FAQs
+
+Use the existing visible FAQ grid.
+
+Allow the user to add, edit, reorder, and remove questions and answers. Support inline links where appropriate.
+
+The reference has eight FAQs, but other guides may have different numbers.
+
+Maintain one canonical FAQ data set for each guide. The HTML renderer and schema generator must use the same saved questions and answers.
+
+### Section management
+
+Provide a clear section navigator.
+
+Users must be able to:
+
+- Add sections.
+- Rename sections.
+- Duplicate sections.
+- Reorder sections.
+- Enable or disable sections.
+- Delete sections with confirmation.
+- Edit sections independently.
+- Preview and export each section independently.
+
+A guide may have a different structure from another guide. Use a configurable section model rather than one enormous hardcoded page template.
+
+## 8. AI-Assisted Content Generation
+
+AI should handle repetitive drafting and classification while the user retains editorial control.
+
+Use AI only when the user explicitly initiates a generation or regeneration action. Do not run AI automatically on every render, save, preview, or export.
+
+### AI tasks
+
+Support contextual generation for:
+
+- Product badges and superlatives.
+- Editorial product titles.
+- Short product descriptions and long-form editorial copy.
+- Section headings and introductions.
+- Category descriptions.
+- Category assignments and product grouping suggestions.
+- Buying-guide content.
+- FAQ questions and answers.
+- Guide-level introductory content where configured.
+
+Use the supplied product information and the current guide's topic, intended audience, style, and section context.
+
+Do not invent product specifications, materials, dimensions, prices, availability, shipping promises, or other factual details.
+
+If source information is insufficient, produce cautious copy or flag the missing information for review.
+
+### Editing controls
+
+Provide field-level or section-level AI actions, such as:
+
+- Generate.
+- Regenerate.
+- Improve.
+- Shorten.
+- Expand.
+- Suggest alternatives.
+
+Show generated results in editable fields.
+
+The user must be able to edit generated content manually and keep those edits.
+
+Never silently overwrite manual edits when regenerating another field. Provide explicit confirmation if an action would replace a large amount of existing content.
+
+### AI usage and cost controls
+
+- Avoid AI calls for deterministic operations.
+- Never invoke generation from rendering loops or uncontrolled effects.
+- Do not repeatedly regenerate content because a component rerenders.
+- Reuse saved generated content until the user requests a new generation.
+- Provide bounded retries and clear error messages.
+- Do not automatically retry indefinitely.
+- Avoid generating the entire guide when the user only requests one description.
+- Track request status and prevent duplicate submissions while a request is in progress.
+- Use the appropriate supported model and API integration for the configured Google AI Studio environment.
+
+If the AI service is not configured, show a clear configuration or error state rather than displaying fabricated results.
+
+## 9. Live Preview and HTML Rendering
+
+The preview must render the actual generated HTML using the existing CSS class names and structure.
+
+Do not approximate the storefront design with a different React-only visual representation.
+
+Provide two distinct preview modes:
+
+1. **Section preview:** Preview one section at a time, as it would appear within the Fourthwall page.
+2. **Full-guide preview:** Assemble the enabled sections in their configured order to inspect the overall page.
+
+The full-guide preview should use the existing templates and stylesheet assumptions.
+
+Because the stylesheet is installed in the Fourthwall header and may not be present in the application, provide a preview environment that loads an appropriate copy of the supplied stylesheet or an equivalent preview-only stylesheet derived from the original.
+
+Never include the preview stylesheet in the exported section HTML.
+
+The preview should accurately represent:
+
+- Product images.
+- Typography.
+- Grid layouts.
+- Spacing.
+- Responsive breakpoints.
+- Links.
+- Badges.
+- Prices.
+- Section ordering.
+
+Handle missing product images gracefully. Show a placeholder in the editor and avoid generating invalid image markup.
+
+Keep HTML rendering deterministic and safely escaped. Do not execute arbitrary user-provided scripts in the preview.
+
+## 10. HTML Export for Fourthwall
+
+Every section must be independently exportable.
+
+Provide clear controls such as:
+
+- Copy HTML.
+- Download HTML.
+- Preview section.
+- Export full guide.
+
+The exported HTML must:
+
+- Contain the appropriate section markup only.
+- Use the exact existing CSS class names.
+- Use valid, properly escaped HTML.
+- Preserve the intended content and ordering.
+- Include the necessary section wrapper and anchor ID.
+- Use the correct product URLs, images, titles, and prices.
+- Avoid including application UI code, React code, Firebase code, or AI integration code.
+- Avoid including the site's global stylesheet.
+- Avoid unnecessary JavaScript.
+- Avoid adding tracking parameters to product URLs.
+
+When exporting multiple sections for separate Fourthwall custom-code blocks, ensure their IDs are unique across the guide.
+
+For the full-guide export, combine the enabled sections in the correct order. Avoid duplicating global IDs.
+
+Provide copy feedback and report any validation errors before allowing export.
+
+Do not claim that an export was copied successfully unless the clipboard operation succeeds.
+
+## 11. JSON-LD Schema Generator
+
+Build a dedicated schema-generation module using the sample schema supplied in the reference materials.
+
+The initial schema should reproduce the sample's unified `@graph` structure with:
+
+1. `BreadcrumbList`
+2. `ItemList`
+3. `FAQPage`
+
+The output must be a standalone script block suitable for placement in the gift guide footer:
+
+`<script type="application/ld+json"> ... </script>`
+
+### BreadcrumbList
+
+Allow configuration of:
+
+- Site base URL.
+- Breadcrumb hierarchy.
+- Breadcrumb labels.
+- Breadcrumb destinations.
+- Current guide title and canonical URL.
+
+Generate the breadcrumb positions automatically.
+
+### ItemList
+
+Generate the list from the products explicitly selected for inclusion in the schema.
+
+Allow configuration of:
+
+- List name.
+- Description.
+- Canonical guide URL.
+- Included products.
+- Item order.
+
+Generate positions and the product count automatically.
+
+Do not assume that every product in the entire product library belongs in the schema. Provide an explicit way to select the featured products to include.
+
+### FAQPage
+
+Generate the FAQ entries from the same saved FAQ data used by the HTML renderer.
+
+Ensure the questions and answers in the JSON-LD match the visible FAQ content.
+
+### Schema validation
+
+- Generate valid JSON.
+- Escape special characters correctly.
+- Validate JSON syntax.
+- Validate required fields and URL formats.
+- Detect missing canonical URLs, duplicate list positions, and other relevant data issues.
+- Provide a readable validation report.
+- Allow manual inspection of the generated JSON-LD.
+- Support copying and downloading the complete schema.
+
+Generate JSON-LD deterministically from saved data rather than asking AI to construct raw JSON on every request.
+
+Do not promise rich results or ranking improvements. Keep the markup accurate and aligned with the visible page.
+
+## 12. Firestore Data Model and Security
+
+Design a maintainable Firestore schema.
+
+A reasonable starting point is:
+
+- `users/{userId}` for user-specific settings and metadata.
+- `users/{userId}/products/{productId}` for product records.
+- `users/{userId}/guides/{guideId}` for guide metadata and configuration.
+- Additional subcollections or documents for section content if needed to keep documents within Firestore's size limits.
+
+Choose the final structure based on access patterns, expected guide size, and reliable updates.
+
+Firestore documents have size limits, so do not put an arbitrarily large product catalog, all sections, and all generated content into one document.
+
+Use stable IDs and explicit data schemas. Include schema versioning where appropriate.
+
+Implement Firebase Authentication and appropriate Firestore Security Rules so users can read and modify only their authorized data.
+
+Do not trust client-side user IDs as an authorization mechanism. Enforce access control in security rules.
+
+Do not use open public write rules or ship permissive development rules to production.
+
+Provide a clear authentication state, connection status, and recovery path for expired sessions or network failures.
+
+## 13. Reliability, Performance, and Recovery
+
+The app should be usable with large product libraries and guides containing many sections.
+
+Requirements:
+
+- Avoid unnecessary full-project reloads.
+- Minimize redundant Firestore reads and writes.
+- Batch or debounce updates where appropriate.
+- Avoid race conditions between autosave and manual edits.
+- Handle offline or failed network states without falsely reporting success.
+- Use bounded retries with backoff for transient failures.
+- Avoid unbounded background tasks.
+- Use stable React keys and predictable component state.
+- Validate imported data before saving.
+- Preserve the last known good saved content if a generation or export operation fails.
+- Provide clear error messages and actionable recovery instructions.
+
+Do not introduce complicated infrastructure unless the project genuinely requires it.
+
+## 14. Testing and Acceptance Criteria
+
+Do not stop after the interface renders.
+
+Create and execute appropriate unit tests, integration tests, and build checks.
+
+At minimum, verify the following workflows.
+
+### Project persistence
+
+1. Create two independent guides.
+2. Add products and configure sections in each.
+3. Save both projects.
+4. Reload the application.
+5. Reopen each project and verify its content.
+6. Add a new product to one guide without altering the other.
+
+### Editing and AI
+
+1. Edit a product description manually.
+2. Regenerate a different field.
+3. Verify the manual edit remains intact.
+4. Verify AI is not invoked when simply opening the preview or exporting HTML.
+5. Verify failed AI requests do not erase saved content.
+
+### HTML export
+
+1. Export each section independently.
+2. Verify the expected classes and content.
+3. Verify that section IDs are unique.
+4. Verify that no application code or global stylesheet is included.
+5. Verify that the full-guide export preserves section order.
+6. Verify that copied or downloaded output is the same as the rendered output.
+
+### Schema generation
+
+1. Generate the schema for the sample Greek mythology guide.
+2. Verify that the graph contains the configured schema types.
+3. Verify product positions and counts.
+4. Verify FAQ content matches the visible FAQ data.
+5. Verify that the result parses as JSON.
+6. Verify that the standalone script wrapper is correct.
+7. Change the guide title, URL, products, and FAQs and confirm the schema updates.
+
+### Security and resilience
+
+1. Verify unauthorized users cannot access another user's projects.
+2. Verify invalid imported data is rejected or reported safely.
+3. Verify failed network writes are not reported as successful saves.
+4. Verify deletion requires confirmation.
+5. Verify the application does not issue duplicate AI requests from repeated renders.
+6. Run the production build, type checks, and relevant tests.
+
+Use mocks for automated tests where appropriate. Do not generate unnecessary AI calls or modify production data during testing.
+
+If Firebase credentials or project configuration are unavailable, distinguish tests that passed locally from cloud operations that still require configuration.
+
+Report actual test results. Never claim a test passed unless it was executed successfully.
+
+## 15. Implementation Process
+
+Implement this as a series of verifiable milestones rather than generating a large amount of code without checking it.
+
+### Milestone 1: Foundation
+
+- Inspect the current project and reference files.
+- Establish the application architecture.
+- Implement Firebase configuration and authentication.
+- Define the data model.
+- Build the application shell and visual design.
+- Verify that the application builds.
+
+### Milestone 2: Persistent data and editing
+
+- Implement the product library.
+- Implement saved gift-guide projects.
+- Implement section configuration and editing.
+- Implement reliable save, reopen, and update workflows.
+- Verify persistence and isolation between projects.
+
+### Milestone 3: Templates and preview
+
+- Implement the supplied HTML templates.
+- Implement the section renderer.
+- Implement the full-guide preview.
+- Verify the output against the supplied reference.
+
+### Milestone 4: AI and export
+
+- Implement field-level AI generation and editing.
+- Implement independent HTML export.
+- Implement JSON-LD generation, validation, and export.
+- Verify all three workflows.
+
+### Milestone 5: Quality assurance
+
+- Run tests, type checks, and production builds.
+- Fix identified defects.
+- Verify security configuration.
+- Provide exact Firebase setup and deployment instructions.
+- Report any unfinished functionality honestly.
+
+Keep each milestone functional and avoid leaving the application in a broken state between stages.
+
+## 16. Final Deliverable
+
+The finished result must be a usable Gift Guide CMS that lets me:
+
+1. Sign in securely.
+2. Create and save multiple gift guides.
+3. Import and maintain a reusable product library.
+4. Reopen saved projects and continue editing later.
+5. Organize products into flexible sections and categories.
+6. Generate and edit content with AI when needed.
+7. Preview individual sections and the complete guide.
+8. Export clean HTML for separate Fourthwall custom-code blocks.
+9. Generate and validate the unified JSON-LD schema.
+10. Copy or download the schema for placement in the Fourthwall footer.
+11. Back up and restore projects.
+12. Use a visually polished application that is pleasant to work in.
+
+Prioritize correctness, persistent storage, fidelity to the supplied templates, and a reliable editing workflow over unnecessary features.
+
+**Begin by inspecting the existing project and reference materials. Then implement the first milestone, verify it, and continue through the remaining milestones. Do not stop at a proposed architecture or a visual mockup.**

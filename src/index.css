@@ -1,0 +1,186 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-serif: 'Fraunces', Georgia, Cambria, serif;
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+
+    /* Science of Gifts Design System Tokens */
+    --sog-bg-canvas: #FBF9F5;
+    --sog-bg-sidebar: #F2EDE2;
+    --sog-bg-toolbar: #F5F1E7;
+    --sog-bg-surface: #FFFFFF;
+    --sog-bg-subtle: #F7F4EC;
+    --sog-bg-preview-well: #E4DFD3;
+
+    --sog-navy-950: #111A27;
+    --sog-navy-900: #162235;
+    --sog-navy-800: #1E2E46;
+    --sog-ink-primary: #151E2D;
+    --sog-ink-secondary: #334155;
+    --sog-ink-muted: #64748B;
+
+    --sog-powder-bg: #DFEEF5;
+    --sog-powder-subtle: #EFF6FA;
+    --sog-powder-border: #94C0D6;
+    --sog-powder-ink: #123E59;
+
+    --sog-mint-bg: #E1F2EA;
+    --sog-mint-border: #96CDB0;
+    --sog-mint-ink: #134634;
+
+    --sog-border-strong: #D4CDBE;
+    --sog-border-default: #E2DDD1;
+    --sog-border-subtle: #ECE8DF;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--sog-bg-canvas);
+    color: var(--sog-ink-primary);
+  }
+
+  h1, h2, .font-editorial {
+    font-family: var(--font-serif);
+  }
+
+  .font-mono-tabular {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  /* Shared Input & Form Controls */
+  .sog-label {
+    display: block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--sog-ink-secondary);
+    margin-bottom: 0.35rem;
+    letter-spacing: 0.01em;
+  }
+
+  .sog-helper {
+    font-size: 0.7rem;
+    color: var(--sog-ink-muted);
+    margin-top: 0.25rem;
+    line-height: 1.4;
+  }
+
+  .sog-input {
+    width: 100%;
+    padding: 0.45rem 0.7rem;
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    color: var(--sog-ink-primary);
+    background-color: #FFFFFF;
+    border: 1px solid #D5CFC2;
+    border-radius: 0.45rem;
+    transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
+  }
+
+  .sog-input:hover {
+    border-color: #B8B0A0;
+  }
+
+  .sog-input:focus {
+    outline: none;
+    border-color: #1B5A7A;
+    box-shadow: 0 0 0 3px rgba(27, 90, 122, 0.14);
+    background-color: #FFFFFF;
+  }
+
+  /* Shared Button Variants */
+  .sog-btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    padding: 0.45rem 0.9rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #FFFFFF;
+    background-color: var(--sog-navy-900);
+    border: 1px solid var(--sog-navy-950);
+    border-radius: 0.45rem;
+    transition: background-color 140ms ease, transform 100ms ease;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .sog-btn-primary:hover:not(:disabled) {
+    background-color: var(--sog-navy-800);
+  }
+
+  .sog-btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .sog-btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    padding: 0.45rem 0.85rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--sog-ink-primary);
+    background-color: #FFFFFF;
+    border: 1px solid var(--sog-border-strong);
+    border-radius: 0.45rem;
+    transition: background-color 140ms ease, border-color 140ms ease;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .sog-btn-secondary:hover:not(:disabled) {
+    background-color: var(--sog-bg-subtle);
+    border-color: #B8B0A0;
+  }
+
+  .sog-btn-powder {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    padding: 0.45rem 0.85rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--sog-powder-ink);
+    background-color: var(--sog-powder-bg);
+    border: 1px solid var(--sog-powder-border);
+    border-radius: 0.45rem;
+    transition: background-color 140ms ease, border-color 140ms ease;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .sog-btn-powder:hover:not(:disabled) {
+    background-color: #CEE4F0;
+    border-color: #78AEC8;
+  }
+
+  .sog-btn-mint {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    padding: 0.45rem 0.9rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #FFFFFF;
+    background-color: var(--sog-mint-ink);
+    border: 1px solid #0E3527;
+    border-radius: 0.45rem;
+    transition: background-color 140ms ease;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .sog-btn-mint:hover:not(:disabled) {
+    background-color: #0E3527;
+  }
+}

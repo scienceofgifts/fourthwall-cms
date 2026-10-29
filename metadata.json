@@ -1,0 +1,6 @@
+{
+  "name": "Science of Gifts — Fourthwall Gift Guide CMS",
+  "description": "Cloud-backed Editorial Gift Guide CMS, HTML Template Engine, and JSON-LD Schema Generator for Fourthwall storefronts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

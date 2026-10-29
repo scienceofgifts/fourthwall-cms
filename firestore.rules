@@ -1,0 +1,309 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // 3. Entity Validation Blueprints
+    function isValidUserSettings(data) {
+      return data.keys().hasAll(['ownerId', 'displayName', 'defaultStoreBaseUrl', 'schemaVersion', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'displayName', 'defaultStoreBaseUrl', 'schemaVersion', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.displayName is string && data.displayName.size() <= 120
+        && data.defaultStoreBaseUrl is string && data.defaultStoreBaseUrl.size() <= 500
+        && data.schemaVersion is number
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidProduct(data) {
+      return data.keys().hasAll([
+          'ownerId', 'name', 'productUrl', 'imageUrl', 'price', 'currency',
+          'productType', 'category', 'tags', 'shortDescription', 'featuresSpecs',
+          'sourceNotes', 'archived', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'name', 'productUrl', 'imageUrl', 'price', 'currency',
+          'productType', 'category', 'tags', 'shortDescription', 'featuresSpecs',
+          'sourceNotes', 'archived', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 300
+        && data.productUrl is string && data.productUrl.size() >= 1 && data.productUrl.size() <= 1000
+        && data.imageUrl is string && data.imageUrl.size() <= 2000
+        && data.price is string && data.price.size() >= 1 && data.price.size() <= 50
+        && data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 10
+        && data.productType is string && data.productType.size() <= 120
+        && data.category is string && data.category.size() <= 120
+        && data.tags is list && data.tags.size() <= 20
+        && (data.tags.size() == 0 || (data.tags[0] is string && data.tags[0].size() <= 60))
+        && data.shortDescription is string && data.shortDescription.size() <= 2000
+        && data.featuresSpecs is string && data.featuresSpecs.size() <= 3000
+        && data.sourceNotes is string && data.sourceNotes.size() <= 2000
+        && data.archived is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidGiftGuide(data) {
+      return data.keys().hasAll([
+          'ownerId', 'title', 'topic', 'audience', 'slug', 'canonicalUrl',
+          'storeBaseUrl', 'collectionUrl', 'introText', 'sectionCount',
+          'productCount', 'schemaConfig', 'schemaVersion', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'title', 'topic', 'audience', 'slug', 'canonicalUrl',
+          'storeBaseUrl', 'collectionUrl', 'introText', 'sectionCount',
+          'productCount', 'schemaConfig', 'schemaVersion', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 300
+        && data.topic is string && data.topic.size() <= 200
+        && data.audience is string && data.audience.size() <= 500
+        && data.slug is string && data.slug.size() <= 200
+        && data.canonicalUrl is string && data.canonicalUrl.size() <= 1000
+        && data.storeBaseUrl is string && data.storeBaseUrl.size() <= 500
+        && data.collectionUrl is string && data.collectionUrl.size() <= 500
+        && data.introText is string && data.introText.size() <= 5000
+        && data.sectionCount is number && data.sectionCount >= 0 && data.sectionCount <= 100
+        && data.productCount is number && data.productCount >= 0 && data.productCount <= 1000
+        && data.schemaConfig is map && data.schemaConfig.size() <= 20
+        && data.schemaVersion is number
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidGuideSection(data) {
+      return data.keys().hasAll([
+          'ownerId', 'guideId', 'type', 'title', 'anchorId',
+          'order', 'enabled', 'config', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'guideId', 'type', 'title', 'anchorId',
+          'order', 'enabled', 'config', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.guideId is string && data.guideId.size() >= 1 && data.guideId.size() <= 128 && data.guideId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.type is string && data.type.size() <= 40
+        && data.type in ['bookmarks', 'quick_picks', 'editors_pick', 'editorial_list', 'more_gifts_grid', 'category_hub', 'buying_guide', 'faq_grid']
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 300
+        && data.anchorId is string && data.anchorId.size() >= 1 && data.anchorId.size() <= 120
+        && data.order is number && data.order >= 0 && data.order <= 500
+        && data.enabled is bool
+        && data.config is map && data.config.size() <= 40
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidHtmlProject(data) {
+      return data.keys().hasAll([
+          'ownerId', 'name', 'currentHtml', 'originalHtml',
+          'baseUrl', 'editorState', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'name', 'currentHtml', 'originalHtml',
+          'baseUrl', 'editorState', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 300
+        && data.currentHtml is string && data.currentHtml.size() <= 400000
+        && data.originalHtml is string && data.originalHtml.size() <= 400000
+        && data.baseUrl is string && data.baseUrl.size() <= 1000
+        && data.editorState is map && data.editorState.size() <= 15
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // 4. Collection Rules
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId) && (resource == null || existing().ownerId == request.auth.uid);
+      allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+      allow create: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserSettings(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isOwner(userId)
+        && isValidUserSettings(incoming())
+        && isValidId(userId)
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'defaultStoreBaseUrl', 'schemaVersion', 'updatedAt'])
+        );
+
+      allow delete: if isOwner(userId) && isValidId(userId) && existing().ownerId == request.auth.uid;
+
+      // Central Product Library
+      match /products/{productId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(productId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(productId)
+          && isValidProduct(incoming())
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isOwner(userId)
+          && isValidProduct(incoming())
+          && isValidId(userId)
+          && isValidId(productId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            // Action: Edit product metadata
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'productUrl', 'imageUrl', 'price', 'currency',
+              'productType', 'category', 'tags', 'shortDescription',
+              'featuresSpecs', 'sourceNotes', 'archived', 'updatedAt'
+            ])
+            ||
+            // Action: Archive/Unarchive product
+            incoming().diff(existing()).affectedKeys().hasOnly(['archived', 'updatedAt'])
+          );
+
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(productId) && existing().ownerId == request.auth.uid;
+      }
+
+      // Gift Guide Projects
+      match /guides/{guideId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(guideId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(guideId)
+          && isValidGiftGuide(incoming())
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isOwner(userId)
+          && isValidGiftGuide(incoming())
+          && isValidId(userId)
+          && isValidId(guideId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'title', 'topic', 'audience', 'slug', 'canonicalUrl',
+              'storeBaseUrl', 'collectionUrl', 'introText', 'sectionCount',
+              'productCount', 'schemaConfig', 'schemaVersion', 'updatedAt'
+            ])
+          );
+
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(guideId) && existing().ownerId == request.auth.uid;
+
+        // Guide Sections Subcollection (Master Gate enforced against parent Guide)
+        match /sections/{sectionId} {
+          allow get: if isOwner(userId)
+            && isValidId(userId)
+            && isValidId(guideId)
+            && isValidId(sectionId)
+            && (resource == null || existing().ownerId == request.auth.uid)
+            && get(/databases/$(database)/documents/users/$(userId)/guides/$(guideId)).data.ownerId == request.auth.uid;
+
+          allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+          allow create: if isOwner(userId)
+            && isValidId(userId)
+            && isValidId(guideId)
+            && isValidId(sectionId)
+            && isValidGuideSection(incoming())
+            && incoming().guideId == guideId
+            && incoming().createdAt == request.time
+            && incoming().updatedAt == request.time
+            && exists(/databases/$(database)/documents/users/$(userId)/guides/$(guideId))
+            && get(/databases/$(database)/documents/users/$(userId)/guides/$(guideId)).data.ownerId == request.auth.uid;
+
+          allow update: if isOwner(userId)
+            && isValidGuideSection(incoming())
+            && isValidId(userId)
+            && isValidId(guideId)
+            && isValidId(sectionId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().guideId == existing().guideId
+            && incoming().guideId == guideId
+            && incoming().createdAt == existing().createdAt
+            && incoming().updatedAt == request.time
+            && (
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'type', 'title', 'anchorId', 'order', 'enabled', 'config', 'updatedAt'
+              ])
+            )
+            && get(/databases/$(database)/documents/users/$(userId)/guides/$(guideId)).data.ownerId == request.auth.uid;
+
+          allow delete: if isOwner(userId)
+            && isValidId(userId)
+            && isValidId(guideId)
+            && isValidId(sectionId)
+            && existing().ownerId == request.auth.uid
+            && get(/databases/$(database)/documents/users/$(userId)/guides/$(guideId)).data.ownerId == request.auth.uid;
+        }
+      }
+
+      // HTML Editor Projects
+      match /htmlProjects/{projectId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(projectId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(projectId)
+          && isValidHtmlProject(incoming())
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isOwner(userId)
+          && isValidHtmlProject(incoming())
+          && isValidId(userId)
+          && isValidId(projectId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'currentHtml', 'originalHtml', 'baseUrl', 'editorState', 'updatedAt'
+            ])
+          );
+
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(projectId) && existing().ownerId == request.auth.uid;
+      }
+    }
+  }
+}

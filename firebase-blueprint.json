@@ -1,0 +1,401 @@
+{
+  "entities": {
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "User-specific workspace configuration and default storefront URLs.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "The authenticated user UID owning this settings record.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name of the workspace owner.",
+          "maxLength": 120
+        },
+        "defaultStoreBaseUrl": {
+          "type": "string",
+          "description": "Default base URL for the Fourthwall shop (e.g., https://scienceofgifts.com).",
+          "maxLength": 500
+        },
+        "schemaVersion": {
+          "type": "number",
+          "description": "Data model schema version."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation server timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update server timestamp."
+        }
+      },
+      "required": ["ownerId", "displayName", "defaultStoreBaseUrl", "schemaVersion", "createdAt", "updatedAt"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Canonical Fourthwall product record stored in the central Product Library.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID of the product library owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Canonical product name.",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "productUrl": {
+          "type": "string",
+          "description": "Relative or absolute Fourthwall product URL (/products/...).",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "imageUrl": {
+          "type": "string",
+          "description": "Product image URL or empty if relying on Fourthwall data-product-url auto-image.",
+          "maxLength": 2000
+        },
+        "price": {
+          "type": "string",
+          "description": "Formatted or numeric price string (e.g., $24.90 or 24.90).",
+          "minLength": 1,
+          "maxLength": 50
+        },
+        "currency": {
+          "type": "string",
+          "description": "ISO currency code such as USD.",
+          "minLength": 1,
+          "maxLength": 10
+        },
+        "productType": {
+          "type": "string",
+          "description": "Product type classification (e.g., T-Shirt, Hoodie, Spiral Journal, Whiskey Glass).",
+          "maxLength": 120
+        },
+        "category": {
+          "type": "string",
+          "description": "Primary topic or deity/era category (e.g., Hades, Athena, Roman Republic).",
+          "maxLength": 120
+        },
+        "tags": {
+          "type": "array",
+          "description": "List of up to 20 searchable tags.",
+          "maxLength": 20
+        },
+        "shortDescription": {
+          "type": "string",
+          "description": "Short canonical summary of the product.",
+          "maxLength": 2000
+        },
+        "featuresSpecs": {
+          "type": "string",
+          "description": "Verified product specifications, materials, weight, and print details.",
+          "maxLength": 3000
+        },
+        "sourceNotes": {
+          "type": "string",
+          "description": "Optional editorial or sourcing notes.",
+          "maxLength": 2000
+        },
+        "archived": {
+          "type": "boolean",
+          "description": "Whether the product is archived from active selection."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation server timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last modification server timestamp."
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "productUrl",
+        "imageUrl",
+        "price",
+        "currency",
+        "productType",
+        "category",
+        "tags",
+        "shortDescription",
+        "featuresSpecs",
+        "sourceNotes",
+        "archived",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "GiftGuide": {
+      "title": "GiftGuide",
+      "description": "Persistent gift-guide project metadata, canonical FAQ list, and JSON-LD schema settings.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID of the gift guide owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Gift guide title.",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "topic": {
+          "type": "string",
+          "description": "Topic or theme (e.g., Greek Mythology, Roman History, World War II).",
+          "maxLength": 200
+        },
+        "audience": {
+          "type": "string",
+          "description": "Target recipient audience and editorial tone.",
+          "maxLength": 500
+        },
+        "slug": {
+          "type": "string",
+          "description": "URL slug for the gift guide page.",
+          "maxLength": 200
+        },
+        "canonicalUrl": {
+          "type": "string",
+          "description": "Full canonical URL of the gift guide page.",
+          "maxLength": 1000
+        },
+        "storeBaseUrl": {
+          "type": "string",
+          "description": "Base storefront URL used for schema resolution.",
+          "maxLength": 500
+        },
+        "collectionUrl": {
+          "type": "string",
+          "description": "Main collection URL referenced in hubs and FAQs.",
+          "maxLength": 500
+        },
+        "introText": {
+          "type": "string",
+          "description": "Optional guide-level introductory editorial copy.",
+          "maxLength": 5000
+        },
+        "sectionCount": {
+          "type": "number",
+          "description": "Count of configured sections."
+        },
+        "productCount": {
+          "type": "number",
+          "description": "Count of distinct products referenced across sections."
+        },
+        "schemaConfig": {
+          "type": "object",
+          "description": "Structured configuration for BreadcrumbList and ItemList JSON-LD generation."
+        },
+        "schemaVersion": {
+          "type": "number",
+          "description": "Schema version of the guide document."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation server timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last modification server timestamp."
+        }
+      },
+      "required": [
+        "ownerId",
+        "title",
+        "topic",
+        "audience",
+        "slug",
+        "canonicalUrl",
+        "storeBaseUrl",
+        "collectionUrl",
+        "introText",
+        "sectionCount",
+        "productCount",
+        "schemaConfig",
+        "schemaVersion",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "GuideSection": {
+      "title": "GuideSection",
+      "description": "Independently editable and exportable section within a Gift Guide project.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID of the guide owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "guideId": {
+          "type": "string",
+          "description": "Parent GiftGuide ID.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "type": {
+          "type": "string",
+          "description": "Section template type.",
+          "enum": [
+            "bookmarks",
+            "quick_picks",
+            "editors_pick",
+            "editorial_list",
+            "more_gifts_grid",
+            "category_hub",
+            "buying_guide",
+            "faq_grid"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "description": "Section heading or internal label.",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "anchorId": {
+          "type": "string",
+          "description": "HTML section ID used for jump links (e.g., jump-quick-picks).",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "order": {
+          "type": "number",
+          "description": "Numeric ordering index within the guide."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether this section is enabled in full-guide preview and export."
+        },
+        "config": {
+          "type": "object",
+          "description": "Structured template data specific to the section type."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation server timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last modification server timestamp."
+        }
+      },
+      "required": [
+        "ownerId",
+        "guideId",
+        "type",
+        "title",
+        "anchorId",
+        "order",
+        "enabled",
+        "config",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "HtmlProject": {
+      "title": "HtmlProject",
+      "description": "Persistent HTML Editor project containing the full edited HTML source, original imported HTML, base URL, and editor UI state.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID of the project owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Editable project name (e.g., History Gifts Guide).",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "currentHtml": {
+          "type": "string",
+          "description": "Complete current edited HTML source.",
+          "maxLength": 400000
+        },
+        "originalHtml": {
+          "type": "string",
+          "description": "Complete original imported HTML source preserved for restoration.",
+          "maxLength": 400000
+        },
+        "baseUrl": {
+          "type": "string",
+          "description": "Optional base URL for resolving relative image URLs in preview.",
+          "maxLength": 1000
+        },
+        "editorState": {
+          "type": "object",
+          "description": "Saved editor UI settings (viewMode, selectedBlockId, previewViewport, includeFourthwallCss)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation server timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last modification server timestamp."
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "currentHtml",
+        "originalHtml",
+        "baseUrl",
+        "editorState",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserSettings" },
+      "description": "User workspace preferences and default storefront configuration."
+    },
+    "/users/{userId}/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Central reusable Product Library records owned by the user."
+    },
+    "/users/{userId}/guides/{guideId}": {
+      "schema": { "$ref": "#/entities/GiftGuide" },
+      "description": "Saved Gift Guide projects owned by the user."
+    },
+    "/users/{userId}/guides/{guideId}/sections/{sectionId}": {
+      "schema": { "$ref": "#/entities/GuideSection" },
+      "description": "Configurable sections belonging to a specific Gift Guide project."
+    },
+    "/users/{userId}/htmlProjects/{projectId}": {
+      "schema": { "$ref": "#/entities/HtmlProject" },
+      "description": "Saved HTML Editor projects containing full HTML source and editor state."
+    }
+  }
+}
