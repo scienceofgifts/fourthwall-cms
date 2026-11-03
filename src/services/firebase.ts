@@ -41,7 +41,7 @@ import {
   SEED_GREEK_SECTIONS,
   SEED_PRODUCTS,
 } from '../data/greekMythologySeed';
-import { ensureProjectHasSections } from './htmlWorkspaceEngine';
+import { DEFAULT_GIFT_GUIDE_CSS, ensureProjectHasSections } from './htmlWorkspaceEngine';
 import {
   loadManagedCategories,
   migrateAndHydrateProductRecord,
@@ -1029,6 +1029,7 @@ export const DEFAULT_HTML_EDITOR_STATE: HtmlProjectEditorState = {
   selectedBlockId: 'ALL',
   previewViewport: 'desktop',
   includeFourthwallCss: true,
+  customCss: DEFAULT_GIFT_GUIDE_CSS,
 };
 
 export function validateHtmlProjectForSave(
@@ -1136,7 +1137,8 @@ function sanitizeProjectSections(rawSections?: unknown): HtmlProjectSection[] | 
 
 function normalizeEditorState(
   raw?: Partial<HtmlProjectEditorState>,
-  fallbackSections?: HtmlProjectSection[]
+  fallbackSections?: HtmlProjectSection[],
+  fallbackCustomCss?: string
 ): HtmlProjectEditorState {
   const sanitizedStartingNumbers: Record<string, number> = {};
   if (raw?.sectionStartingNumbers && typeof raw.sectionStartingNumbers === 'object') {
@@ -1149,12 +1151,20 @@ function normalizeEditorState(
   }
 
   const sanitizedSections = sanitizeProjectSections(raw?.sections ?? fallbackSections);
+  const rawCss =
+    typeof raw?.customCss === 'string'
+      ? raw.customCss
+      : typeof fallbackCustomCss === 'string'
+      ? fallbackCustomCss
+      : DEFAULT_GIFT_GUIDE_CSS;
+  const sanitizedCss = rawCss.slice(0, MAX_SINGLE_HTML_FIELD_CHARS);
 
   return {
     viewMode:
       raw?.viewMode === 'split' ||
       raw?.viewMode === 'visual' ||
       raw?.viewMode === 'raw' ||
+      raw?.viewMode === 'css' ||
       raw?.viewMode === 'preview'
         ? raw.viewMode
         : 'split',
@@ -1162,6 +1172,7 @@ function normalizeEditorState(
     sidebarTab: raw?.sidebarTab === 'anchors' ? 'anchors' : 'blocks',
     previewViewport: raw?.previewViewport === 'mobile' ? 'mobile' : 'desktop',
     includeFourthwallCss: raw?.includeFourthwallCss !== false,
+    customCss: sanitizedCss,
     ...(Object.keys(sanitizedStartingNumbers).length > 0
       ? { sectionStartingNumbers: sanitizedStartingNumbers }
       : {}),
@@ -1186,7 +1197,11 @@ export function loadLocalHtmlProjects(): HtmlEditorProject[] {
               typeof item.currentHtml === 'string'
           )
           .map((item) => {
-            const normalizedEditorState = normalizeEditorState(item.editorState, item.sections);
+            const normalizedEditorState = normalizeEditorState(
+              item.editorState,
+              item.sections,
+              typeof item.customCss === 'string' ? item.customCss : undefined
+            );
             return ensureProjectHasSections({
               id: item.id,
               ownerId: typeof item.ownerId === 'string' ? item.ownerId : 'local-preview',
@@ -1196,6 +1211,7 @@ export function loadLocalHtmlProjects(): HtmlEditorProject[] {
                 typeof item.originalHtml === 'string' ? item.originalHtml : item.currentHtml,
               baseUrl:
                 typeof item.baseUrl === 'string' ? item.baseUrl : 'https://scienceofgifts.com',
+              customCss: normalizedEditorState.customCss,
               sections: normalizedEditorState.sections,
               editorState: normalizedEditorState,
               createdAt:
@@ -1299,7 +1315,11 @@ function sanitizeHtmlProjectFirestorePayload(userId: string, project: HtmlEditor
     currentHtml: (project.currentHtml || '').slice(0, MAX_SINGLE_HTML_FIELD_CHARS),
     originalHtml: (project.originalHtml || '').slice(0, MAX_SINGLE_HTML_FIELD_CHARS),
     baseUrl: (project.baseUrl || 'https://scienceofgifts.com').trim().slice(0, 1000),
-    editorState: normalizeEditorState(project.editorState, project.sections),
+    editorState: normalizeEditorState(
+      project.editorState,
+      project.sections,
+      project.customCss ?? project.editorState?.customCss
+    ),
   };
 }
 
@@ -1385,7 +1405,11 @@ export function subscribeToHtmlProjects(
       const nowIso = new Date().toISOString();
       const cloudItems: HtmlEditorProject[] = snap.docs.map((d) => {
         const data = d.data();
-        const normalizedState = normalizeEditorState(data.editorState);
+        const normalizedState = normalizeEditorState(
+          data.editorState,
+          undefined,
+          typeof data.customCss === 'string' ? data.customCss : undefined
+        );
         return ensureProjectHasSections({
           id: d.id,
           ownerId: String(data.ownerId || userId),
@@ -1393,6 +1417,7 @@ export function subscribeToHtmlProjects(
           currentHtml: String(data.currentHtml || ''),
           originalHtml: String(data.originalHtml ?? data.currentHtml ?? ''),
           baseUrl: String(data.baseUrl || 'https://scienceofgifts.com'),
+          customCss: normalizedState.customCss,
           sections: normalizedState.sections,
           editorState: normalizedState,
           createdAt: timestampToIso(data.createdAt, nowIso),
@@ -1444,7 +1469,11 @@ export async function saveHtmlProject(
   const nowIso = new Date().toISOString();
   const existingList = loadLocalHtmlProjects();
   const existingRecord = existingList.find((p) => p.id === cleanId);
-  const normalizedEditorState = normalizeEditorState(hydrated.editorState, hydrated.sections);
+  const normalizedEditorState = normalizeEditorState(
+    hydrated.editorState,
+    hydrated.sections,
+    hydrated.customCss ?? hydrated.editorState?.customCss
+  );
 
   const savedRecord: HtmlEditorProject = {
     id: cleanId,
@@ -1453,6 +1482,7 @@ export async function saveHtmlProject(
     currentHtml: hydrated.currentHtml,
     originalHtml: hydrated.originalHtml,
     baseUrl: (hydrated.baseUrl || 'https://scienceofgifts.com').trim(),
+    customCss: normalizedEditorState.customCss,
     sections: normalizedEditorState.sections,
     editorState: normalizedEditorState,
     createdAt: existingRecord?.createdAt || hydrated.createdAt || nowIso,
@@ -1483,6 +1513,7 @@ export async function createNewHtmlProject(
     initialHtml?: string;
     htmlContent?: string;
     baseUrl?: string;
+    customCss?: string;
     userId?: string | null;
     sections?: HtmlProjectSection[];
     editorState?: Partial<HtmlProjectEditorState>;
@@ -1495,6 +1526,11 @@ export async function createNewHtmlProject(
   const newId = sanitizeId(
     `proj-${params.name.toLowerCase().slice(0, 32)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`
   );
+  const normalizedState = normalizeEditorState(
+    params.editorState,
+    params.sections,
+    params.customCss ?? params.editorState?.customCss
+  );
   const baseProject: HtmlEditorProject = ensureProjectHasSections({
     id: newId,
     ownerId: effectiveUserId || 'local-preview',
@@ -1502,8 +1538,9 @@ export async function createNewHtmlProject(
     currentHtml: html,
     originalHtml: html,
     baseUrl: (params.baseUrl || 'https://scienceofgifts.com').trim(),
+    customCss: normalizedState.customCss,
     sections: params.sections,
-    editorState: normalizeEditorState(params.editorState, params.sections),
+    editorState: normalizedState,
     createdAt: nowIso,
     updatedAt: nowIso,
   });

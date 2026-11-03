@@ -1,14 +1,16 @@
 import React, { useMemo, useState } from 'react';
 import { Copy, Check, Download, Code, Eye, Monitor, Smartphone, Tablet } from 'lucide-react';
-import { LOCKED_FOURTHWALL_CSS } from '../constants/lockedCss';
 import { GuideSection, Product } from '../types/cms';
 import { renderFullGuideHtml, renderSectionHtml } from '../services/htmlRenderer';
+import { getActiveLocalHtmlProjectId, loadLocalHtmlProjects } from '../services/firebase';
+import { buildFourthwallExportCode, resolveProjectCss } from '../services/htmlWorkspaceEngine';
 
 interface LivePreviewPanelProps {
   sections: GuideSection[];
   activeSectionId: string | null;
   products: Product[];
   guideSlug: string;
+  customCss?: string;
 }
 
 export const LivePreviewPanel: React.FC<LivePreviewPanelProps> = ({
@@ -16,11 +18,22 @@ export const LivePreviewPanel: React.FC<LivePreviewPanelProps> = ({
   activeSectionId,
   products,
   guideSlug,
+  customCss,
 }) => {
   const [previewScope, setPreviewScope] = useState<'section' | 'full'>('section');
   const [viewTab, setViewTab] = useState<'visual' | 'html'>('visual');
   const [viewportWidth, setViewportWidth] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+
+  const activeCss = useMemo(() => {
+    if (typeof customCss === 'string' && customCss.trim().length > 0) {
+      return resolveProjectCss(customCss);
+    }
+    const projects = loadLocalHtmlProjects();
+    const activeId = getActiveLocalHtmlProjectId();
+    const activeProj = projects.find((p) => p.id === activeId) || projects[0] || null;
+    return resolveProjectCss(activeProj);
+  }, [customCss]);
 
   const activeSection = useMemo(
     () => sections.find((s) => s.id === activeSectionId) || sections[0] || null,
@@ -36,14 +49,16 @@ export const LivePreviewPanel: React.FC<LivePreviewPanelProps> = ({
     return renderFullGuideHtml(sections, products, { forPreview: true });
   }, [previewScope, activeSection, sections, products]);
 
-  // Exact exported HTML for Fourthwall custom-code block (never includes preview stylesheet or preview SVGs)
+  // Exact exported HTML for Fourthwall custom-code block
   const exportHtml = useMemo(() => {
     if (previewScope === 'section') {
       if (!activeSection) return '';
-      return renderSectionHtml(activeSection, products, { forPreview: false });
+      const rawSec = renderSectionHtml(activeSection, products, { forPreview: false });
+      return buildFourthwallExportCode(rawSec, activeCss, { includeCss: true });
     }
-    return renderFullGuideHtml(sections, products, { forPreview: false });
-  }, [previewScope, activeSection, sections, products]);
+    const rawFull = renderFullGuideHtml(sections, products, { forPreview: false });
+    return buildFourthwallExportCode(rawFull, activeCss, { includeCss: true });
+  }, [previewScope, activeSection, sections, products, activeCss]);
 
   // Complete srcDoc for the isolated iframe preview so Fourthwall responsive breakpoints (@media) work accurately
   const iframeSrcDoc = useMemo(() => {
@@ -62,14 +77,14 @@ export const LivePreviewPanel: React.FC<LivePreviewPanelProps> = ({
       line-height: 1.5;
     }
     * { box-sizing: border-box; }
-    ${LOCKED_FOURTHWALL_CSS}
+    ${activeCss}
   </style>
 </head>
 <body>
   ${visualHtml}
 </body>
 </html>`;
-  }, [visualHtml]);
+  }, [visualHtml, activeCss]);
 
   const handleCopyExportHtml = async () => {
     if (!exportHtml) return;

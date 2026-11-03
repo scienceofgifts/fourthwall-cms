@@ -296,11 +296,12 @@ export interface HtmlProjectSection {
 }
 
 export interface HtmlProjectEditorState {
-  viewMode: 'split' | 'visual' | 'raw' | 'preview';
+  viewMode: 'split' | 'visual' | 'raw' | 'css' | 'preview';
   selectedBlockId: string;
   sidebarTab?: 'blocks' | 'anchors';
   previewViewport: 'desktop' | 'mobile';
   includeFourthwallCss: boolean;
+  customCss?: string;
   sectionStartingNumbers?: Record<string, number>;
   sections?: HtmlProjectSection[];
 }
@@ -312,6 +313,7 @@ export interface HtmlEditorProject {
   currentHtml: string;
   originalHtml: string;
   baseUrl: string;
+  customCss?: string;
   editorState: HtmlProjectEditorState;
   sections?: HtmlProjectSection[];
   createdAt: string;

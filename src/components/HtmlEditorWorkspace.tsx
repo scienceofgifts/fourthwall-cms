@@ -47,8 +47,11 @@ import {
   appendHtmlSectionToProject,
   applyCatalogProductToCard,
   attachPreviewImageFallbacks,
+  buildFourthwallExportCode,
+  buildPreviewIframeDocument,
   buildSafePreviewHtml,
   buildSectionStartingNumbersMap,
+   DEFAULT_GIFT_GUIDE_CSS,
   deleteProjectSectionById,
   deriveProjectSectionsFromHtml,
   ensureProjectHasSections,
@@ -64,12 +67,14 @@ import {
   reorderProjectSectionById,
   reorderRepeatedGroupItem,
   replaceProjectHtmlContent,
+  resolveProjectCss,
   resolveSectionStartingNumbers,
   updateElementAttributes,
   updateElementIdAndReferences,
   updateHtmlNodeText,
   updateProductCardPrice,
   updateProductCardUrls,
+  updateProjectCss,
   updateProjectSectionHtmlById,
   updateProjectSectionStartingNumberById,
   updateProjectSectionTypeById,
@@ -88,7 +93,6 @@ import {
 } from '../services/firebase';
 import { renderFullGuideHtml, renderSectionHtml } from '../services/htmlRenderer';
 import { SEED_GREEK_SECTIONS, SEED_PRODUCTS } from '../data/greekMythologySeed';
-import { LOCKED_FOURTHWALL_CSS } from '../constants/lockedCss';
 import {
   ConfiguredGeminiModelId,
   GEMINI_MODEL_CHANGED_EVENT,
@@ -119,7 +123,7 @@ interface ChangeLogEntry {
   description: string;
 }
 
-type WorkspaceViewMode = 'split' | 'visual' | 'raw' | 'preview';
+type WorkspaceViewMode = 'split' | 'visual' | 'raw' | 'css' | 'preview';
 type ProjectSaveStatus = 'saved' | 'saving' | 'unsaved' | 'error';
 type PasteDrawerMode = 'add_section' | 'replace_project' | null;
 
@@ -209,12 +213,14 @@ function initializeProjectsState(
       currentHtml: initialCurrentHtml,
       originalHtml: initialOriginalHtml,
       baseUrl: defaultBaseUrl,
+      customCss: DEFAULT_GIFT_GUIDE_CSS,
       editorState: {
         viewMode: 'split',
         selectedBlockId: 'ALL',
         sidebarTab: 'blocks',
         previewViewport: 'desktop',
         includeFourthwallCss: true,
+        customCss: DEFAULT_GIFT_GUIDE_CSS,
       },
       createdAt: nowIso,
       updatedAt: nowIso,
@@ -264,6 +270,9 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     () => initialData.activeProject.sections || []
   );
   const [currentHtml, setCurrentHtml] = useState<string>(initialData.activeProject.currentHtml);
+  const [currentCss, setCurrentCss] = useState<string>(() =>
+    resolveProjectCss(initialData.activeProject)
+  );
 
   // Section-level Starting Product Number map (persisted per project)
   const [sectionStartingNumbers, setSectionStartingNumbers] = useState<Record<string, number>>(
@@ -289,6 +298,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     currentHtml: string;
     originalHtml: string;
     baseUrl: string;
+    customCss: string;
     sectionsJson: string;
     sectionStartingNumbersJson: string;
   }>(() => {
@@ -298,12 +308,14 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
       initAnalysis.blocks,
       initialData.activeProject.editorState?.sectionStartingNumbers
     );
+    const initCss = resolveProjectCss(initialData.activeProject);
     return {
       id: initialData.activeProject.id,
       name: initialData.activeProject.name,
       currentHtml: initialData.activeProject.currentHtml,
       originalHtml: initialData.activeProject.originalHtml,
       baseUrl: initialData.activeProject.baseUrl || defaultBaseUrl,
+      customCss: initCss,
       sectionsJson: JSON.stringify(initSecs),
       sectionStartingNumbersJson: JSON.stringify(resolvedInit),
     };
@@ -347,6 +359,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     mode: 'section' | 'complete_project';
     sectionId?: string;
   } | null>(null);
+  const [exportIncludeCss, setExportIncludeCss] = useState<boolean>(true);
   const [exportCopyFeedback, setExportCopyFeedback] = useState<{
     status: 'copied' | 'fallback';
     message: string;
@@ -356,6 +369,16 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
   // Raw HTML editor buffer & dirty tracking
   const [rawEditorBuffer, setRawEditorBuffer] = useState(initialData.activeProject.currentHtml);
   const [rawBufferDirty, setRawBufferDirty] = useState(false);
+
+  // CSS Editor buffer, dirty tracking, Replace CSS modal/drawer, and Reset confirmation
+  const [cssEditorBuffer, setCssEditorBuffer] = useState<string>(() =>
+    resolveProjectCss(initialData.activeProject)
+  );
+  const [cssBufferDirty, setCssBufferDirty] = useState(false);
+  const [showReplaceCssModal, setShowReplaceCssModal] = useState(false);
+  const [replaceCssBuffer, setReplaceCssBuffer] = useState('');
+  const [confirmResetDefaultCss, setConfirmResetDefaultCss] = useState(false);
+  const cssEditorTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Preview settings & iframe ref
   const [previewViewport, setPreviewViewport] = useState<'desktop' | 'mobile'>(
@@ -465,6 +488,13 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     }
   }, [currentHtml, rawBufferDirty]);
 
+  // Sync cssEditorBuffer when currentCss changes from project load or Replace CSS
+  useEffect(() => {
+    if (!cssBufferDirty) {
+      setCssEditorBuffer(currentCss);
+    }
+  }, [currentCss, cssBufferDirty]);
+
   // Subscribe to Cloud Firestore HTML Projects when user is signed in
   useEffect(() => {
     if (!userId) return;
@@ -497,10 +527,19 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     [analysis.blocks, sectionStartingNumbers]
   );
 
-  // Total project export evaluation (character count & Fourthwall 30k limit status)
+  const effectiveCss = cssBufferDirty ? cssEditorBuffer : currentCss;
+
+  // Total project export evaluation (character count & Fourthwall 30k limit status, including active CSS when enabled)
   const completeProjectExportStatus = useMemo(
-    () => evaluateHtmlExportSize(rawBufferDirty ? rawEditorBuffer : currentHtml),
-    [currentHtml, rawBufferDirty, rawEditorBuffer]
+    () =>
+      evaluateHtmlExportSize(
+        buildFourthwallExportCode(
+          rawBufferDirty ? rawEditorBuffer : currentHtml,
+          effectiveCss,
+          { includeCss: includeFourthwallCss }
+        )
+      ),
+    [currentHtml, effectiveCss, includeFourthwallCss, rawBufferDirty, rawEditorBuffer]
   );
 
   // Determine whether the active project has genuinely unsaved edits compared to its last persisted state
@@ -512,16 +551,20 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     const currentSectionsJson = JSON.stringify(sections);
     return (
       rawBufferDirty ||
+      cssBufferDirty ||
       trimmedName !== lastSavedSnapshot.name ||
       effectiveHtml !== lastSavedSnapshot.currentHtml ||
       originalHtml !== lastSavedSnapshot.originalHtml ||
       (projectBaseUrl || '') !== (lastSavedSnapshot.baseUrl || '') ||
+      effectiveCss !== lastSavedSnapshot.customCss ||
       currentSectionsJson !== lastSavedSnapshot.sectionsJson ||
       currentStartingJson !== lastSavedSnapshot.sectionStartingNumbersJson
     );
   }, [
     activeProjectId,
+    cssBufferDirty,
     currentHtml,
+    effectiveCss,
     lastSavedSnapshot,
     originalHtml,
     projectBaseUrl,
@@ -558,6 +601,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
       overrideOriginalHtml?: string;
       overrideName?: string;
       overrideBaseUrl?: string;
+      overrideCustomCss?: string;
       overrideSections?: HtmlProjectSection[];
       overrideSectionStartingNumbers?: Record<string, number>;
       overrideSelectedBlockId?: string;
@@ -582,6 +626,18 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
         setRawBufferDirty(false);
       }
 
+      const nextCustomCss =
+        options?.overrideCustomCss !== undefined
+          ? options.overrideCustomCss
+          : cssBufferDirty
+          ? cssEditorBuffer
+          : currentCss;
+      if (cssBufferDirty || options?.overrideCustomCss !== undefined) {
+        setCurrentCss(nextCustomCss);
+        setCssEditorBuffer(nextCustomCss);
+        setCssBufferDirty(false);
+      }
+
       const effectiveOriginalHtml = options?.overrideOriginalHtml ?? originalHtml;
       const effectiveName = (options?.overrideName ?? projectName).trim() || 'Untitled Gift Guide';
       const effectiveBaseUrl = (options?.overrideBaseUrl ?? projectBaseUrl).trim();
@@ -596,6 +652,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
         currentHtml: effectiveCurrentHtml,
         originalHtml: effectiveOriginalHtml,
         baseUrl: effectiveBaseUrl,
+        customCss: nextCustomCss,
         sections: effectiveSections,
         editorState: {
           viewMode,
@@ -603,6 +660,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
           sidebarTab,
           previewViewport,
           includeFourthwallCss,
+          customCss: nextCustomCss,
           sections: effectiveSections,
           sectionStartingNumbers: effectiveStartingNumbers,
         },
@@ -632,6 +690,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
         }
 
         const savedSections = saved.sections || saved.editorState?.sections || effectiveSections;
+        const savedCss = resolveProjectCss(saved);
         setProjects(loadLocalHtmlProjects());
         setLastSavedSnapshot({
           id: saved.id,
@@ -639,6 +698,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
           currentHtml: saved.currentHtml,
           originalHtml: saved.originalHtml,
           baseUrl: saved.baseUrl || '',
+          customCss: savedCss,
           sectionsJson: JSON.stringify(savedSections),
           sectionStartingNumbersJson: JSON.stringify(effectiveStartingNumbers),
         });
@@ -663,6 +723,9 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     [
       activeProjectId,
       cancelPendingAutosave,
+      cssBufferDirty,
+      cssEditorBuffer,
+      currentCss,
       currentHtml,
       includeFourthwallCss,
       onShowToast,
@@ -700,7 +763,9 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
   }, [
     activeProjectId,
     cancelPendingAutosave,
+    currentCss,
     currentHtml,
+    effectiveCss,
     isProjectDirty,
     lastSavedSnapshot.id,
     originalHtml,
@@ -724,6 +789,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
         projAnalysis.blocks,
         proj.editorState?.sectionStartingNumbers
       );
+      const projCss = resolveProjectCss(proj);
 
       setActiveLocalHtmlProjectId(proj.id);
       setActiveProjectId(proj.id);
@@ -735,6 +801,11 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
       setCurrentHtml(proj.currentHtml);
       setRawEditorBuffer(proj.currentHtml);
       setRawBufferDirty(false);
+      setCurrentCss(projCss);
+      setCssEditorBuffer(projCss);
+      setCssBufferDirty(false);
+      setShowReplaceCssModal(false);
+      setConfirmResetDefaultCss(false);
       setSectionStartingNumbers(projStartingNumbers);
       setStartingNumberInputDrafts({});
       setRenamingSectionId(null);
@@ -750,6 +821,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
         currentHtml: proj.currentHtml,
         originalHtml: proj.originalHtml,
         baseUrl: proj.baseUrl || 'https://scienceofgifts.com',
+        customCss: projCss,
         sectionsJson: JSON.stringify(projSections),
         sectionStartingNumbersJson: JSON.stringify(projStartingNumbers),
       });
@@ -771,6 +843,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
 
   // Helper to build an in-memory HtmlEditorProject snapshot representing current workspace state
   const buildCurrentWorkspaceProjectSnapshot = useCallback((): HtmlEditorProject => {
+    const resolvedCurrentCss = cssBufferDirty ? cssEditorBuffer : currentCss;
     return {
       id: activeProjectId,
       ownerId: userId || 'local-preview',
@@ -778,6 +851,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
       currentHtml,
       originalHtml,
       baseUrl: projectBaseUrl,
+      customCss: resolvedCurrentCss,
       sections,
       editorState: {
         viewMode,
@@ -785,6 +859,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
         sidebarTab,
         previewViewport,
         includeFourthwallCss,
+        customCss: resolvedCurrentCss,
         sections,
         sectionStartingNumbers: resolvedSectionStartingNumbers,
       },
@@ -793,6 +868,9 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     };
   }, [
     activeProjectId,
+    cssBufferDirty,
+    cssEditorBuffer,
+    currentCss,
     currentHtml,
     includeFourthwallCss,
     originalHtml,
@@ -819,6 +897,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
       const nextSections = updatedProj.sections || [];
       const nextHtml = updatedProj.currentHtml;
       const nextOriginalHtml = updatedProj.originalHtml;
+      const nextCss = resolveProjectCss(updatedProj);
       const nextStartingMap =
         updatedProj.editorState?.sectionStartingNumbers ||
         buildSectionStartingNumbersMap(nextSections, products, sectionStartingNumbers);
@@ -830,6 +909,9 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
       setOriginalHtml(nextOriginalHtml);
       setRawEditorBuffer(nextHtml);
       setRawBufferDirty(false);
+      setCurrentCss(nextCss);
+      setCssEditorBuffer(nextCss);
+      setCssBufferDirty(false);
       setSectionStartingNumbers(nextStartingMap);
       if (nextSelectedBlockId !== selectedBlockId) {
         setSelectedBlockId(nextSelectedBlockId);
@@ -852,6 +934,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
         void performSaveActiveProject({
           overrideHtml: nextHtml,
           overrideOriginalHtml: nextOriginalHtml,
+          overrideCustomCss: nextCss,
           overrideSections: nextSections,
           overrideSectionStartingNumbers: nextStartingMap,
           overrideSelectedBlockId: nextSelectedBlockId,
@@ -1010,9 +1093,33 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     }
   };
 
-  const hasDiffFromOriginal = currentHtml !== originalHtml || rawBufferDirty;
+  const hasDiffFromOriginal =
+    currentHtml !== originalHtml ||
+    rawBufferDirty ||
+    effectiveCss !== DEFAULT_GIFT_GUIDE_CSS;
 
-  // Switch between Visual / Split / Raw / Preview safely without discarding raw edits
+  // Apply and save CSS changes without resetting product data, sections, or guide content
+  const handleApplyAndSaveCss = useCallback(
+    (newCssValue?: string, toastMsg?: string) => {
+      const targetCss = newCssValue !== undefined ? newCssValue : cssEditorBuffer;
+      const updatedProj = updateProjectCss(
+        buildCurrentWorkspaceProjectSnapshot(),
+        targetCss,
+        products
+      );
+      commitUpdatedProjectState(
+        updatedProj,
+        `Updated Gift Guide CSS stylesheet (${targetCss.length.toLocaleString()} chars)`,
+        {
+          persistImmediately: true,
+          toastMessage: toastMsg || 'Applied and saved Gift Guide CSS stylesheet.',
+        }
+      );
+    },
+    [buildCurrentWorkspaceProjectSnapshot, commitUpdatedProjectState, cssEditorBuffer, products]
+  );
+
+  // Switch between Visual / Split / Raw / CSS / Preview safely without discarding raw or CSS edits
   const handleSwitchViewMode = (targetMode: WorkspaceViewMode) => {
     if (rawBufferDirty && targetMode !== 'raw') {
       const updatedProj = replaceProjectHtmlContent(
@@ -1032,6 +1139,9 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
           toastMessage: 'Applied and re-analyzed your Raw HTML edits.',
         }
       );
+    }
+    if (cssBufferDirty && targetMode !== 'css') {
+      handleApplyAndSaveCss(cssEditorBuffer, 'Applied and saved your CSS edits.');
     }
     setViewMode(targetMode);
   };
@@ -1440,34 +1550,12 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
   );
 
   const previewIframeSrcDoc = useMemo(() => {
-    return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      color: #111;
-      background: #fff;
-      margin: 0;
-      padding: 24px 28px 64px 28px;
-      line-height: 1.5;
-    }
-    img {
-      max-width: 100%;
-      height: auto;
-      opacity: 1 !important;
-      visibility: visible !important;
-    }
-    ${includeFourthwallCss ? LOCKED_FOURTHWALL_CSS : ''}
-  </style>
-</head>
-<body>
-${safePreviewBodyHtml}
-</body>
-</html>`;
-  }, [safePreviewBodyHtml, includeFourthwallCss]);
+    return buildPreviewIframeDocument(
+      safePreviewBodyHtml,
+      effectiveCss,
+      includeFourthwallCss
+    );
+  }, [safePreviewBodyHtml, effectiveCss, includeFourthwallCss]);
 
   const handlePreviewIframeLoad = useCallback(() => {
     try {
@@ -1495,28 +1583,47 @@ ${safePreviewBodyHtml}
       });
   }, [products, catalogPickerSearch]);
 
-  // Resolved Export Modal Payload
+  // Resolved Export Modal Payload (includes current CSS when exportIncludeCss is enabled)
   const activeExportPayload = useMemo(() => {
     if (!exportModalTarget) return null;
     if (exportModalTarget.mode === 'section' && exportModalTarget.sectionId) {
       const sec = sectionMapById.get(exportModalTarget.sectionId);
       if (sec) {
+        const sectionCode = buildFourthwallExportCode(sec.htmlContent, effectiveCss, {
+          includeCss: exportIncludeCss,
+        });
         return {
           title: `Export Section: ${sec.name}`,
-          subtitle: `${HUMAN_SECTION_TYPE_LABELS[sec.type] || sec.type} (Section ${sec.order + 1} of ${sections.length})`,
+          subtitle: `${HUMAN_SECTION_TYPE_LABELS[sec.type] || sec.type} (Section ${sec.order + 1} of ${sections.length})${
+            exportIncludeCss ? ' · Includes Active CSS Stylesheet' : ' · HTML Only'
+          }`,
           fileBaseName: `${projectName}-${sec.name}`,
-          ...evaluateHtmlExportSize(sec.htmlContent),
+          ...evaluateHtmlExportSize(sectionCode),
         };
       }
     }
     const fullHtml = rawBufferDirty ? rawEditorBuffer : joinProjectSectionsHtml(sections);
+    const completeCode = buildFourthwallExportCode(fullHtml, effectiveCss, {
+      includeCss: exportIncludeCss,
+    });
     return {
       title: `Export Complete Project: ${projectName}`,
-      subtitle: `All ${sections.length} section(s) concatenated in displayed order`,
+      subtitle: `All ${sections.length} section(s) concatenated in displayed order${
+        exportIncludeCss ? ' + Active Gift Guide CSS (<style>...)' : ' (HTML Only)'
+      }`,
       fileBaseName: projectName,
-      ...evaluateHtmlExportSize(fullHtml),
+      ...evaluateHtmlExportSize(completeCode),
     };
-  }, [exportModalTarget, projectName, rawBufferDirty, rawEditorBuffer, sectionMapById, sections]);
+  }, [
+    effectiveCss,
+    exportIncludeCss,
+    exportModalTarget,
+    projectName,
+    rawBufferDirty,
+    rawEditorBuffer,
+    sectionMapById,
+    sections,
+  ]);
 
   // Helper to render a Product Card editor inside either a primary block or an attached nested block
   const renderProductCardEditor = (
@@ -2356,6 +2463,20 @@ ${safePreviewBodyHtml}
             </span>
           </button>
 
+          <button
+            type="button"
+            onClick={() => {
+              handleSwitchViewMode('css');
+              setReplaceCssBuffer(effectiveCss);
+              setShowReplaceCssModal(true);
+            }}
+            className="sog-btn-secondary"
+            title="Open the CSS Editor and replace the gift guide stylesheet"
+          >
+            <Replace className="w-3.5 h-3.5" />
+            <span>Replace CSS</span>
+          </button>
+
           <div className="flex items-center gap-2 text-[#334155]">
             <span className="font-mono-tabular font-semibold text-[#111A27]">
               {sections.length} section(s)
@@ -2370,6 +2491,7 @@ ${safePreviewBodyHtml}
               type="button"
               onClick={() => {
                 setExportCopyFeedback(null);
+                setExportIncludeCss(true);
                 setExportModalTarget({ mode: 'complete_project' });
               }}
               className={`font-mono-tabular px-2 py-0.5 rounded border text-[11px] font-semibold inline-flex items-center gap-1 ${
@@ -2441,6 +2563,18 @@ ${safePreviewBodyHtml}
           >
             <Code className="w-3.5 h-3.5" />
             <span>Raw HTML{rawBufferDirty ? ' *' : ''}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSwitchViewMode('css')}
+            className={`px-2.5 py-1 rounded-md font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+              viewMode === 'css'
+                ? 'bg-[#111A27] text-white'
+                : 'text-[#334155] hover:text-[#111A27]'
+            }`}
+          >
+            <FileCode className="w-3.5 h-3.5" />
+            <span>CSS Editor{cssBufferDirty ? ' *' : ''}</span>
           </button>
           <button
             type="button"
@@ -2526,6 +2660,7 @@ ${safePreviewBodyHtml}
             type="button"
             onClick={() => {
               setExportCopyFeedback(null);
+              setExportIncludeCss(true);
               setExportModalTarget({ mode: 'complete_project' });
             }}
             className="sog-btn-powder"
@@ -2537,8 +2672,11 @@ ${safePreviewBodyHtml}
           <button
             type="button"
             onClick={() => {
-              const exported = rawBufferDirty ? rawEditorBuffer : currentHtml;
-              handleDownloadHtmlFile(exported, projectName);
+              const exportedHtml = rawBufferDirty ? rawEditorBuffer : currentHtml;
+              const exportedWithCss = buildFourthwallExportCode(exportedHtml, effectiveCss, {
+                includeCss: includeFourthwallCss,
+              });
+              handleDownloadHtmlFile(exportedWithCss, projectName);
             }}
             className="sog-btn-secondary"
           >
@@ -2549,8 +2687,14 @@ ${safePreviewBodyHtml}
           <button
             type="button"
             onClick={() => {
-              const exported = rawBufferDirty ? rawEditorBuffer : currentHtml;
-              void handleCopyHtmlWithFallback(exported, 'complete project HTML');
+              const exportedHtml = rawBufferDirty ? rawEditorBuffer : currentHtml;
+              const exportedWithCss = buildFourthwallExportCode(exportedHtml, effectiveCss, {
+                includeCss: includeFourthwallCss,
+              });
+              void handleCopyHtmlWithFallback(
+                exportedWithCss,
+                'complete Fourthwall CSS + HTML'
+              );
             }}
             className="sog-btn-mint"
           >
@@ -2813,7 +2957,7 @@ ${safePreviewBodyHtml}
       {/* MAIN 3-COLUMN WORKSPACE BODY */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* LEFT SIDEBAR: MULTI-SECTION STRUCTURE NAVIGATOR & ANCHOR ID INSPECTOR */}
-        {viewMode !== 'preview' && viewMode !== 'raw' && (
+        {viewMode !== 'preview' && viewMode !== 'raw' && viewMode !== 'css' && (
           <aside className="w-76 bg-[#F2EDE2] border-r border-[#D5CFC0] flex flex-col shrink-0 select-none">
             <div className="p-3 border-b border-[#D5CFC0] flex items-center gap-1 bg-[#EAE3D5]">
               <button
@@ -4514,8 +4658,228 @@ ${safePreviewBodyHtml}
           </main>
         )}
 
+        {/* DEDICATED CSS EDITOR MODE (SYNCHRONIZED WITH LIVE PREVIEW & FOURTHWALL EXPORT) */}
+        {viewMode === 'css' && (
+          <main className="flex-1 flex flex-col p-6 space-y-3 min-w-0">
+            <div className="flex flex-wrap items-center justify-between gap-3 bg-[#162235] text-white px-4 py-3 rounded-xl">
+              <div className="space-y-0.5">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-sm font-editorial font-semibold">
+                    CSS Editor — Gift Guide Stylesheet
+                  </h2>
+                  <span
+                    className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
+                      effectiveCss.trim() === DEFAULT_GIFT_GUIDE_CSS.trim()
+                        ? 'bg-[#24344D] text-[#94C0D6]'
+                        : 'bg-[#E1F2EA] text-[#134634]'
+                    }`}
+                  >
+                    {effectiveCss.trim() === DEFAULT_GIFT_GUIDE_CSS.trim()
+                      ? 'Default Fourthwall CSS'
+                      : 'Custom Stylesheet Active'}
+                  </span>
+                  <span className="text-[11px] font-mono-tabular text-[#94C0D6]">
+                    {cssEditorBuffer.split('\n').length} lines ·{' '}
+                    {cssEditorBuffer.length.toLocaleString()} chars
+                  </span>
+                </div>
+                <p className="text-[11px] text-[#C6D3E3]">
+                  Stored separately from your HTML sections. Changes sync immediately to the Live
+                  Preview and are included in the final Fourthwall code.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (cssEditorTextareaRef.current) {
+                      cssEditorTextareaRef.current.focus();
+                      cssEditorTextareaRef.current.select();
+                      onShowToast?.(
+                        'Selected all CSS in the editor. Paste a new stylesheet or press Ctrl+C to copy.'
+                      );
+                    }
+                  }}
+                  className="px-3 py-1.5 bg-[#24344D] hover:bg-[#314666] text-[#DFEEF5] rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"
+                >
+                  <Code className="w-3.5 h-3.5" />
+                  <span>Select All CSS</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setReplaceCssBuffer('');
+                    setShowReplaceCssModal((prev) => !prev);
+                  }}
+                  className="px-3 py-1.5 bg-[#DFEEF5] hover:bg-[#CBE3EE] text-[#111A27] rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"
+                >
+                  <Replace className="w-3.5 h-3.5" />
+                  <span>{showReplaceCssModal ? 'Close Replace CSS' : 'Replace CSS'}</span>
+                </button>
+
+                {confirmResetDefaultCss ? (
+                  <div className="inline-flex items-center gap-1.5 bg-red-950/90 border border-red-400 px-2.5 py-1 rounded-lg text-xs">
+                    <span className="text-red-100 font-semibold">Reset to default CSS?</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfirmResetDefaultCss(false);
+                        setShowReplaceCssModal(false);
+                        handleApplyAndSaveCss(
+                          DEFAULT_GIFT_GUIDE_CSS,
+                          'Restored default Fourthwall CSS stylesheet.'
+                        );
+                      }}
+                      className="px-2 py-0.5 bg-red-600 hover:bg-red-500 text-white rounded font-semibold"
+                    >
+                      Confirm Reset
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmResetDefaultCss(false)}
+                      className="px-1.5 py-0.5 text-[#C6D3E3] hover:text-white"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmResetDefaultCss(true)}
+                    className="px-2.5 py-1.5 bg-[#24344D] hover:bg-[#314666] text-[#C6D3E3] hover:text-white rounded-lg text-xs font-semibold inline-flex items-center gap-1"
+                    title="Restore the default Fourthwall .sog-* stylesheet"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Reset to Default</span>
+                  </button>
+                )}
+
+                {cssBufferDirty && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCssEditorBuffer(currentCss);
+                      setCssBufferDirty(false);
+                      onShowToast?.('Reverted unapplied CSS edits.');
+                    }}
+                    className="px-2.5 py-1.5 bg-[#24344D] text-[#C6D3E3] hover:text-white rounded-lg text-xs font-semibold"
+                  >
+                    Discard Edits
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleApplyAndSaveCss(
+                      cssEditorBuffer,
+                      'Applied CSS to Live Preview and saved to project.'
+                    )
+                  }
+                  className="sog-btn-mint"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>{cssBufferDirty ? 'Apply & Save CSS' : 'Apply CSS'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* REPLACE CSS WORKFLOW DRAWER */}
+            {showReplaceCssModal && (
+              <div className="bg-[#EFF6FA] border border-[#94C0D6] rounded-xl p-4 space-y-3 text-xs shadow-inner">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wider font-bold text-[#1A567B]">
+                      Replace Entire Stylesheet Workflow
+                    </p>
+                    <h3 className="text-sm font-editorial font-semibold text-[#111A27]">
+                      Paste New Gift Guide CSS Stylesheet
+                    </h3>
+                    <p className="text-[#3E4C5E]">
+                      Paste a completely new stylesheet below (with or without surrounding{' '}
+                      <code>&lt;style&gt;</code> tags) and click{' '}
+                      <strong>Replace &amp; Apply CSS</strong> to overwrite the existing CSS and
+                      sync the preview immediately.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setReplaceCssBuffer(cssEditorBuffer)}
+                    className="sog-btn-secondary py-1 px-2.5"
+                  >
+                    Load Current CSS into Box
+                  </button>
+                </div>
+
+                <textarea
+                  rows={7}
+                  aria-label="Replacement CSS Stylesheet"
+                  value={replaceCssBuffer}
+                  onChange={(e) => setReplaceCssBuffer(e.target.value)}
+                  placeholder="Paste your complete replacement CSS stylesheet here (e.g. .sog-guide-container { ... })..."
+                  spellCheck={false}
+                  className="w-full p-3.5 bg-[#111926] text-[#E6EEF8] rounded-xl font-mono-tabular text-xs leading-relaxed focus:outline-none border border-[#2C3E58]"
+                />
+
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowReplaceCssModal(false);
+                      setReplaceCssBuffer('');
+                    }}
+                    className="sog-btn-secondary"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const cleaned = replaceCssBuffer
+                        .trim()
+                        .replace(/^\s*<style\b[^>]*>/i, '')
+                        .replace(/<\/style>\s*$/i, '')
+                        .trim();
+                      if (!cleaned) {
+                        onShowToast?.('Please paste CSS rules before replacing the stylesheet.');
+                        return;
+                      }
+                      setShowReplaceCssModal(false);
+                      setReplaceCssBuffer('');
+                      handleApplyAndSaveCss(
+                        cleaned,
+                        'Replaced Gift Guide CSS, updated Live Preview, and saved project.'
+                      );
+                    }}
+                    className="sog-btn-primary"
+                  >
+                    <Replace className="w-3.5 h-3.5" />
+                    <span>Replace &amp; Apply CSS</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <textarea
+              ref={cssEditorTextareaRef}
+              aria-label="Gift Guide CSS Editor"
+              value={cssEditorBuffer}
+              onChange={(e) => {
+                const rawVal = e.target.value;
+                setCssEditorBuffer(rawVal);
+                setCssBufferDirty(rawVal !== currentCss);
+              }}
+              spellCheck={false}
+              placeholder="Write or paste your Gift Guide CSS rules here..."
+              className="flex-1 w-full p-4 bg-[#111926] text-[#E6EEF8] rounded-xl font-mono-tabular text-xs leading-relaxed focus:outline-none border border-[#2C3E58]"
+            />
+          </main>
+        )}
+
         {/* RIGHT PANEL: ISOLATED LIVE STOREFRONT PREVIEW */}
-        {(viewMode === 'split' || viewMode === 'preview') && (
+        {(viewMode === 'split' || viewMode === 'css' || viewMode === 'preview') && (
           <aside
             className={`${
               viewMode === 'preview' ? 'flex-1' : 'w-[46%] max-w-[680px]'
@@ -4528,7 +4892,7 @@ ${safePreviewBodyHtml}
                   Isolated Storefront Preview ({sections.length} section{sections.length === 1 ? '' : 's'})
                 </span>
                 <span className="text-[11px] text-[#94A3B8]">
-                  (Scripts neutralized; source untouched)
+                  (Synced with CSS Editor)
                 </span>
               </div>
 
@@ -4540,8 +4904,17 @@ ${safePreviewBodyHtml}
                     onChange={(e) => setIncludeFourthwallCss(e.target.checked)}
                     className="rounded border-[#475569]"
                   />
-                  <span>Fourthwall `.sog-*` CSS</span>
+                  <span>Apply Guide CSS</span>
                 </label>
+
+                <button
+                  type="button"
+                  onClick={() => handleSwitchViewMode(viewMode === 'css' ? 'split' : 'css')}
+                  className="px-2 py-0.5 bg-[#22314A] hover:bg-[#2F4363] text-[#DFEEF5] rounded text-[11px] font-semibold"
+                  title="Open or close the CSS Editor alongside the Live Preview"
+                >
+                  {viewMode === 'css' ? 'Back to Visual' : 'Edit CSS'}
+                </button>
 
                 <div className="flex items-center gap-1 p-0.5 bg-[#22314A] rounded-md">
                   <button
@@ -4599,7 +4972,7 @@ ${safePreviewBodyHtml}
             <div className="flex items-start justify-between border-b border-[#DED8CA] pb-3 gap-3">
               <div>
                 <p className="text-[11px] uppercase tracking-wider text-[#1A567B] font-bold">
-                  Fourthwall HTML Export &amp; Character Limit Inspector
+                  Fourthwall CSS + HTML Export &amp; Character Limit Inspector
                 </p>
                 <h2 className="text-lg font-editorial font-semibold text-[#111A27]">
                   {activeExportPayload.title}
@@ -4618,43 +4991,55 @@ ${safePreviewBodyHtml}
               </button>
             </div>
 
-            {/* Scope Selector: Switch between Complete Project or Individual Sections */}
-            <div className="flex flex-wrap items-center gap-2 bg-[#EFECE2] p-2.5 rounded-lg border border-[#D5CFC0]">
-              <span className="text-[11px] font-semibold text-[#111A27]">Export Target:</span>
-              <button
-                type="button"
-                onClick={() => {
-                  setExportCopyFeedback(null);
-                  setExportModalTarget({ mode: 'complete_project' });
-                }}
-                className={`px-2.5 py-1 rounded-md font-semibold transition-colors ${
-                  exportModalTarget.mode === 'complete_project'
-                    ? 'bg-[#111A27] text-white'
-                    : 'bg-white text-[#334155] border border-[#D5CFC0]'
-                }`}
-              >
-                Complete Project ({sections.length} Sections ·{' '}
-                {completeProjectExportStatus.characterCount.toLocaleString()} chars)
-              </button>
-
-              {sections.map((sec, idx) => (
+            {/* Scope Selector: Switch between Complete Project or Individual Sections + CSS Inclusion Toggle */}
+            <div className="flex flex-wrap items-center justify-between gap-2 bg-[#EFECE2] p-2.5 rounded-lg border border-[#D5CFC0]">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[11px] font-semibold text-[#111A27]">Export Target:</span>
                 <button
-                  key={sec.id}
                   type="button"
                   onClick={() => {
                     setExportCopyFeedback(null);
-                    setExportModalTarget({ mode: 'section', sectionId: sec.id });
+                    setExportIncludeCss(true);
+                    setExportModalTarget({ mode: 'complete_project' });
                   }}
                   className={`px-2.5 py-1 rounded-md font-semibold transition-colors ${
-                    exportModalTarget.mode === 'section' && exportModalTarget.sectionId === sec.id
-                      ? 'bg-[#1A567B] text-white'
+                    exportModalTarget.mode === 'complete_project'
+                      ? 'bg-[#111A27] text-white'
                       : 'bg-white text-[#334155] border border-[#D5CFC0]'
                   }`}
                 >
-                  {String(idx + 1).padStart(2, '0')}. {sec.name} ({sec.htmlContent.length.toLocaleString()}{' '}
-                  chars)
+                  Complete Project ({sections.length} Sections ·{' '}
+                  {completeProjectExportStatus.characterCount.toLocaleString()} chars)
                 </button>
-              ))}
+
+                {sections.map((sec, idx) => (
+                  <button
+                    key={sec.id}
+                    type="button"
+                    onClick={() => {
+                      setExportCopyFeedback(null);
+                      setExportModalTarget({ mode: 'section', sectionId: sec.id });
+                    }}
+                    className={`px-2.5 py-1 rounded-md font-semibold transition-colors ${
+                      exportModalTarget.mode === 'section' && exportModalTarget.sectionId === sec.id
+                        ? 'bg-[#1A567B] text-white'
+                        : 'bg-white text-[#334155] border border-[#D5CFC0]'
+                    }`}
+                  >
+                    {String(idx + 1).padStart(2, '0')}. {sec.name} ({sec.htmlContent.length.toLocaleString()}{' '}
+                    chars)
+                  </button>
+                ))}
+              </div>
+
+              <label className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-white border border-[#C8C0B0] rounded-md font-semibold text-[11px] text-[#111A27] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={exportIncludeCss}
+                  onChange={(e) => setExportIncludeCss(e.target.checked)}
+                />
+                <span>Include Active CSS (&lt;style&gt;...&lt;/style&gt;)</span>
+              </label>
             </div>
 
             {/* Character Count & Fourthwall 30,000-Char Limit Status Bar */}

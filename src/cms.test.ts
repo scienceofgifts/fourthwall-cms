@@ -59,6 +59,11 @@ import {
   updateProjectSectionStartingNumberById,
   updateProjectSectionTypeById,
   updateSectionProductNumbering,
+  DEFAULT_GIFT_GUIDE_CSS,
+  buildFourthwallExportCode,
+  buildPreviewIframeDocument,
+  resolveProjectCss,
+  updateProjectCss,
 } from './services/htmlWorkspaceEngine';
 import {
   createNewHtmlProject,
@@ -2498,7 +2503,7 @@ describe('Feature 8: Modal Rich-Text Editor for First Three Editorial Fields (Su
       </article>
     `;
 
-    const report = analyzeHtmlDocument(sampleCardHtml, SEED_PRODUCTS);
+    const report = analyzeHtmlDocument(sampleCardHtml, sampleProducts);
     const card = report.blocks[0].productCards[0];
     expect(card).toBeDefined();
 
@@ -2525,7 +2530,7 @@ describe('Feature 8: Modal Rich-Text Editor for First Three Editorial Fields (Su
       </article>
     `;
 
-    const initialReport = analyzeHtmlDocument(cardHtml, SEED_PRODUCTS);
+    const initialReport = analyzeHtmlDocument(cardHtml, sampleProducts);
     const card = initialReport.blocks[0].productCards[0];
 
     // 1. Update Dek with formatted HTML
@@ -2539,7 +2544,7 @@ describe('Feature 8: Modal Rich-Text Editor for First Three Editorial Fields (Su
     expect(updatedWithRichDek).toContain('<h3 class="sog-ed-title">Atlas</h3>'); // Sibling preserved!
 
     // 2. Update Description with multiple paragraphs and lists
-    const updatedDescReport = analyzeHtmlDocument(updatedWithRichDek, SEED_PRODUCTS);
+    const updatedDescReport = analyzeHtmlDocument(updatedWithRichDek, sampleProducts);
     const card2 = updatedDescReport.blocks[0].productCards[0];
 
     const richCopy = '<p>Paragraph 1 with <em>emphasis</em>.</p><ul><li>Feature A</li><li>Feature B</li></ul>';
@@ -2553,7 +2558,7 @@ describe('Feature 8: Modal Rich-Text Editor for First Three Editorial Fields (Su
     expect(updatedWithRichCopy).toContain('<strong>monumental</strong>'); // Dek preserved!
 
     // 3. Update Specs with formatted bullets
-    const updatedSpecsReport = analyzeHtmlDocument(updatedWithRichCopy, SEED_PRODUCTS);
+    const updatedSpecsReport = analyzeHtmlDocument(updatedWithRichCopy, sampleProducts);
     const card3 = updatedSpecsReport.blocks[0].productCards[0];
 
     const richSpecs = '<p>• <strong>Material:</strong> 100% Cotton</p><p>• <strong>Origin:</strong> USA</p>';
@@ -2569,31 +2574,194 @@ describe('Feature 8: Modal Rich-Text Editor for First Three Editorial Fields (Su
   it('7. renders editorial_list in htmlRenderer with rich markup intact and safely sanitized', () => {
     const mockSection: GuideSection = {
       id: 'sec-editorial-test',
+      ownerId: 'local-preview',
       guideId: 'guide-test',
       type: 'editorial_list',
       title: 'History Essentials',
+      anchorId: 'history-essentials',
+      enabled: true,
       order: 1,
       config: {
         editorialItems: [
           {
+            id: 'ed-item-1',
             order: 1,
-            productId: 'prod-atlas',
+            productId: sampleProducts[0].id,
+            rankNumber: '#01',
+            superlativeBadge: 'Best Overall',
+            eyebrowCategory: 'Cartography',
+            priceDisplay: '$34.00',
+            priceNote: 'Unisex',
             displayTitle: 'The Classical Atlas',
             dek: 'A <strong>gorgeous</strong> edition with <a href="https://example.com">ancient maps</a>.',
             editorialCopy: '<p>Every map was hand-restored.</p><p>Includes <em>marginalia</em>.</p>',
             specsCallout: '<p>• <strong>Binding:</strong> Leatherette</p>',
+            tagsText: 'Best for: History buffs',
+            ctaLabel: 'Shop Gift →',
+            productUrlOverride: '',
+            imageUrlOverride: '',
           },
         ],
       },
     };
 
-    const rendered = renderSectionHtml(mockSection, SEED_PRODUCTS, { forPreview: false });
+    const rendered = renderSectionHtml(mockSection, sampleProducts, { forPreview: false });
     expect(rendered).toContain('<p class="sog-ed-dek">A <strong>gorgeous</strong> edition with <a href="https://example.com">ancient maps</a>.</p>');
     expect(rendered).toContain('<div class="sog-ed-copy">\n<p>Every map was hand-restored.</p><p>Includes <em>marginalia</em>.</p>\n        </div>');
     expect(rendered).toContain('<strong>Binding:</strong> Leatherette');
   });
 });
 
+describe('Feature 9: Replaceable & Preview-Synced Gift Guide CSS Editor', () => {
+  it('1. loads existing default CSS when opening or creating a project with no custom CSS override', async () => {
+    const project = await createNewHtmlProject({
+      name: 'Default CSS Guide',
+      htmlContent: '<section class="sog-guide-container"><h2 class="sog-chapter-title">Olympus Gifts</h2></section>',
+    });
 
+    expect(resolveProjectCss(project)).toBe(DEFAULT_GIFT_GUIDE_CSS);
+    expect(project.customCss).toBe(DEFAULT_GIFT_GUIDE_CSS);
+    expect(project.editorState.customCss).toBe(DEFAULT_GIFT_GUIDE_CSS);
+    expect(DEFAULT_GIFT_GUIDE_CSS).toContain('.sog-chapter-banner');
+    expect(DEFAULT_GIFT_GUIDE_CSS).toContain('.sog-ed-card');
+  });
 
+  it('2. replaces the entire CSS stylesheet independently without resetting product data, sections, or numbering', async () => {
+    const initialHtml = `
+      <section class="sog-guide-container" id="sec-roman">
+        <div class="sog-chapter-banner"><h2 class="sog-chapter-title">Roman Artifacts</h2></div>
+        <div class="sog-editorial-list">
+          <article class="sog-ed-card">
+            <div class="sog-ed-header">
+              <div class="sog-ed-rank-box"><span class="sog-ed-num">#05</span></div>
+              <div class="sog-ed-title-wrap"><h3 class="sog-ed-title"><a href="/products/spqr-mug">SPQR Ceramic Mug</a></h3></div>
+            </div>
+            <div class="sog-ed-body"><p class="sog-ed-dek">Hand-glazed imperial crimson mug.</p></div>
+          </article>
+        </div>
+      </section>
+    `;
 
+    let project = await createNewHtmlProject({
+      name: 'Roman Empire Guide',
+      htmlContent: initialHtml,
+    });
+
+    project = updateProjectSectionStartingNumberById(project, project.sections![0].id, 5, sampleProducts);
+
+    const brandNewStylesheet = `
+      /* Complete Replacement Stylesheet v2 */
+      .sog-guide-container { max-width: 1240px; background: #fffdf9; border: 3px solid #7c2d12; }
+      .sog-ed-card { border-radius: 24px; box-shadow: 0 12px 32px rgba(124, 45, 18, 0.15); }
+      .sog-ed-title a { color: #7c2d12; text-transform: uppercase; }
+    `.trim();
+
+    // Also test stripping outer <style> wrapper if the user pastes <style>...</style>
+    const updatedProject = updateProjectCss(
+      project,
+      `<style>\n${brandNewStylesheet}\n</style>`,
+      sampleProducts
+    );
+
+    expect(updatedProject.customCss).toBe(brandNewStylesheet);
+    expect(updatedProject.editorState.customCss).toBe(brandNewStylesheet);
+    expect(resolveProjectCss(updatedProject)).toBe(brandNewStylesheet);
+
+    // HTML sections, product card content, and starting product number remain untouched
+    expect(updatedProject.sections).toHaveLength(1);
+    expect(updatedProject.sections![0].name).toContain('Roman Artifacts');
+    expect(updatedProject.sections![0].startingProductNumber).toBe(5);
+    expect(updatedProject.currentHtml).toContain('SPQR Ceramic Mug');
+    expect(updatedProject.currentHtml).toContain('#05');
+  });
+
+  it('3. synchronizes the live preview iframe document with the replaced CSS and never uses the old stylesheet', () => {
+    const safeBodyHtml = '<section class="sog-guide-container"><h2 class="sog-chapter-title">Preview Sync Check</h2></section>';
+    const replacementCss = '.sog-guide-container { background: rgb(18, 52, 86); color: #f8fafc; }';
+
+    const previewDoc = buildPreviewIframeDocument(safeBodyHtml, replacementCss, true);
+
+    expect(previewDoc).toContain(replacementCss);
+    expect(previewDoc).toContain('Preview Sync Check');
+    // Must not inject the old default stylesheet when replacement CSS is active
+    expect(previewDoc).not.toContain('/* 1. CHAPTER BANNERS */');
+  });
+
+  it('4. persists replaced CSS across project saves, reloads, and switching between multiple saved guides', async () => {
+    const cssGuideA = '/* Guide A Custom CSS */ .sog-guide-container { border-color: #1e40af; }';
+    const cssGuideB = '/* Guide B Custom CSS */ .sog-guide-container { border-color: #065f46; }';
+
+    let guideA = await createNewHtmlProject({
+      name: 'Guide A - Naval History',
+      htmlContent: '<section class="sog-guide-container"><h2>Naval Picks</h2></section>',
+    });
+    guideA = updateProjectCss(guideA, cssGuideA);
+    await saveHtmlProject(guideA);
+
+    let guideB = await createNewHtmlProject({
+      name: 'Guide B - Botanical History',
+      htmlContent: '<section class="sog-guide-container"><h2>Botanical Picks</h2></section>',
+    });
+    guideB = updateProjectCss(guideB, cssGuideB);
+    await saveHtmlProject(guideB);
+
+    // Reload from persistent storage (simulating closing & reopening the app or switching projects)
+    const reloadedProjects = loadLocalHtmlProjects();
+    const loadedA = reloadedProjects.find((p) => p.id === guideA.id)!;
+    const loadedB = reloadedProjects.find((p) => p.id === guideB.id)!;
+
+    expect(loadedA).toBeDefined();
+    expect(loadedB).toBeDefined();
+    expect(resolveProjectCss(loadedA)).toBe(cssGuideA);
+    expect(resolveProjectCss(loadedB)).toBe(cssGuideB);
+  });
+
+  it('5. exports final Fourthwall code with the current replaced CSS and HTML, never exporting outdated CSS', async () => {
+    let project = await createNewHtmlProject({
+      name: 'Fourthwall Final Export Guide',
+      htmlContent: '<section class="sog-guide-container" id="sec-1"><h2>Section 1</h2></section>',
+    });
+
+    project = appendHtmlSectionToProject(
+      project,
+      '<section class="sog-guide-container" id="sec-2"><h2>Section 2 FAQ</h2></section>',
+      { name: 'Section 2', manualType: 'faq_section' },
+      sampleProducts
+    );
+
+    const newFourthwallCss = `
+/* Custom Fourthwall Production Stylesheet 2026 */
+.sog-guide-container { font-family: "Georgia", serif; margin: 32px auto; }
+.sog-ed-cta { background: #1d4ed8 !important; color: #ffffff !important; }
+    `.trim();
+
+    project = updateProjectCss(project, newFourthwallCss, sampleProducts);
+
+    // Complete project export includes <style> with the new CSS + all HTML sections in order
+    const exportedWithCss = exportCompleteProjectHtml(project, sampleProducts, { includeCss: true });
+    expect(exportedWithCss.html).toContain(`<style>\n${newFourthwallCss}\n</style>`);
+    expect(exportedWithCss.html).toContain('<section class="sog-guide-container" id="sec-1"><h2>Section 1</h2></section>');
+    expect(exportedWithCss.html).toContain('<section class="sog-guide-container" id="sec-2"><h2>Section 2 FAQ</h2></section>');
+    // Never contains the old default stylesheet
+    expect(exportedWithCss.html).not.toContain('/* 1. CHAPTER BANNERS */');
+
+    // Individual section export with includeCss: true also uses the new CSS
+    const sectionExportWithCss = exportProjectSectionHtml(
+      project,
+      project.sections![0].id,
+      sampleProducts,
+      { includeCss: true }
+    );
+    expect(sectionExportWithCss.html).toContain(`<style>\n${newFourthwallCss}\n</style>`);
+    expect(sectionExportWithCss.html).toContain('Section 1');
+    expect(sectionExportWithCss.html).not.toContain('Section 2 FAQ');
+
+    // HTML-only export option omits <style> cleanly when requested
+    const htmlOnlyExport = buildFourthwallExportCode(project.currentHtml, newFourthwallCss, {
+      includeCss: false,
+    });
+    expect(htmlOnlyExport).not.toContain('<style>');
+    expect(htmlOnlyExport).toContain('Section 1');
+    expect(htmlOnlyExport).toContain('Section 2 FAQ');
+  });
+});

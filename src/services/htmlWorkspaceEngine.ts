@@ -5,6 +5,7 @@ import {
   Product,
 } from '../types/cms';
 import { buildEditorialSvgDataUri } from '../data/greekMythologySeed';
+import { LOCKED_FOURTHWALL_CSS } from '../constants/lockedCss';
 import { normalizeProductUrlForMatch } from './briefGenerator';
 
 export interface HtmlAttr {
@@ -3866,14 +3867,130 @@ export function buildSectionStartingNumbersMap(
   return map;
 }
 
+export const DEFAULT_GIFT_GUIDE_CSS = LOCKED_FOURTHWALL_CSS.trim();
+
 /**
- * Ensures an HtmlEditorProject has a synchronized `sections` array in both `project.sections` and `project.editorState.sections`.
+ * Resolves the active stylesheet for a project, defaulting to the existing Fourthwall `.sog-*` CSS
+ * when no custom CSS has been saved yet.
+ */
+export function resolveProjectCss(
+  projectOrCss?: Pick<HtmlEditorProject, 'customCss' | 'editorState'> | string | null
+): string {
+  if (typeof projectOrCss === 'string') {
+    return projectOrCss;
+  }
+  if (projectOrCss && typeof projectOrCss === 'object') {
+    if (typeof projectOrCss.customCss === 'string') {
+      return projectOrCss.customCss;
+    }
+    if (typeof projectOrCss.editorState?.customCss === 'string') {
+      return projectOrCss.editorState.customCss;
+    }
+  }
+  return DEFAULT_GIFT_GUIDE_CSS;
+}
+
+/**
+ * Updates the CSS stored on a project independently of its HTML sections and product data.
+ */
+export function updateProjectCss(
+  project: HtmlEditorProject,
+  newCss: string,
+  catalogProducts: Product[] = []
+): HtmlEditorProject {
+  const normalized = ensureProjectHasSections(project, catalogProducts);
+  const nowIso = new Date().toISOString();
+  const cleanCss =
+    typeof newCss === 'string'
+      ? newCss
+          .trim()
+          .replace(/^<style[^>]*>/i, '')
+          .replace(/<\/style>$/i, '')
+          .trim()
+      : '';
+  return {
+    ...normalized,
+    customCss: cleanCss,
+    editorState: {
+      ...normalized.editorState,
+      customCss: cleanCss,
+    },
+    updatedAt: nowIso,
+  };
+}
+
+/**
+ * Strips any leading `<style>` wrapper previously generated for export so CSS is never duplicated,
+ * and combines the active CSS (`<style>...</style>`) and HTML for Fourthwall export.
+ */
+export function buildFourthwallExportCode(
+  htmlContent: string,
+  cssContent?: string,
+  options?: { includeCss?: boolean }
+): string {
+  const cleanHtml = (htmlContent || '').trim();
+  const includeCss = options?.includeCss !== false;
+  if (!includeCss) {
+    return cleanHtml;
+  }
+  const resolvedCss =
+    typeof cssContent === 'string' ? cssContent.trim() : DEFAULT_GIFT_GUIDE_CSS;
+  if (!resolvedCss) {
+    return cleanHtml;
+  }
+  return `<style>\n${resolvedCss}\n</style>\n\n${cleanHtml}`;
+}
+
+/**
+ * Builds the complete HTML document injected into the isolated Live Preview iframe,
+ * using the exact current CSS that will be exported to Fourthwall.
+ */
+export function buildPreviewIframeDocument(
+  safePreviewBodyHtml: string,
+  cssContent?: string,
+  includeCss = true
+): string {
+  const resolvedCss =
+    typeof cssContent === 'string' ? cssContent : DEFAULT_GIFT_GUIDE_CSS;
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: #111;
+      background: #fff;
+      margin: 0;
+      padding: 24px 28px 64px 28px;
+      line-height: 1.5;
+    }
+    img {
+      max-width: 100%;
+      height: auto;
+      opacity: 1 !important;
+      visibility: visible !important;
+    }
+    ${includeCss ? resolvedCss : ''}
+  </style>
+</head>
+<body>
+${safePreviewBodyHtml}
+</body>
+</html>`;
+}
+
+/**
+ * Ensures an HtmlEditorProject has a synchronized `sections` array in both `project.sections` and `project.editorState.sections`,
+ * and preserves its `customCss` (defaulting to DEFAULT_GIFT_GUIDE_CSS).
  * Safely migrates existing projects that only stored `currentHtml` as a single string.
  */
 export function ensureProjectHasSections(
   project: HtmlEditorProject,
   catalogProducts: Product[] = []
 ): HtmlEditorProject {
+  const resolvedCss = resolveProjectCss(project);
   const rawSections = project.sections ?? project.editorState?.sections;
   if (Array.isArray(rawSections) && rawSections.length > 0) {
     const sorted = [...rawSections]
@@ -3895,9 +4012,11 @@ export function ensureProjectHasSections(
         return {
           ...project,
           currentHtml: '',
+          customCss: resolvedCss,
           sections: [],
           editorState: {
             ...project.editorState,
+            customCss: resolvedCss,
             sections: [],
           },
         };
@@ -3924,9 +4043,11 @@ export function ensureProjectHasSections(
         return {
           ...project,
           currentHtml: project.currentHtml.trim(),
+          customCss: resolvedCss,
           sections: nextSecs,
           editorState: {
             ...project.editorState,
+            customCss: resolvedCss,
             sections: nextSecs,
             sectionStartingNumbers: nextStartingMap,
           },
@@ -3957,9 +4078,11 @@ export function ensureProjectHasSections(
       return {
         ...project,
         currentHtml: joinProjectSectionsHtml(rederived),
+        customCss: resolvedCss,
         sections: rederived,
         editorState: {
           ...project.editorState,
+          customCss: resolvedCss,
           sections: rederived,
           sectionStartingNumbers: nextStartingMap,
         },
@@ -3974,9 +4097,11 @@ export function ensureProjectHasSections(
     return {
       ...project,
       currentHtml: joined,
+      customCss: resolvedCss,
       sections: sorted,
       editorState: {
         ...project.editorState,
+        customCss: resolvedCss,
         sections: sorted,
         sectionStartingNumbers: nextStartingMap,
       },
@@ -3988,9 +4113,11 @@ export function ensureProjectHasSections(
     return {
       ...project,
       currentHtml: '',
+      customCss: resolvedCss,
       sections: [],
       editorState: {
         ...project.editorState,
+        customCss: resolvedCss,
         sections: [],
       },
     };
@@ -4011,9 +4138,11 @@ export function ensureProjectHasSections(
   return {
     ...project,
     currentHtml: joined || project.currentHtml,
+    customCss: resolvedCss,
     sections: derived,
     editorState: {
       ...project.editorState,
+      customCss: resolvedCss,
       sections: derived,
       sectionStartingNumbers: nextStartingMap,
     },
@@ -4428,27 +4557,44 @@ export function updateProjectSectionStartingNumberById(
 export function exportProjectSectionHtml(
   project: HtmlEditorProject,
   sectionId: string,
-  catalogProducts: Product[] = []
+  catalogProducts: Product[] = [],
+  options?: { includeCss?: boolean; customCss?: string }
 ): HtmlExportPayload {
   const normalized = ensureProjectHasSections(project, catalogProducts);
   const target = (normalized.sections || []).find((s) => s.id === sectionId);
   if (!target) {
     throw new Error(`Section "${sectionId}" not found in project.`);
   }
-  return evaluateHtmlExportSize(target.htmlContent);
+  const output = options?.includeCss
+    ? buildFourthwallExportCode(
+        target.htmlContent,
+        options.customCss ?? resolveProjectCss(normalized),
+        { includeCss: true }
+      )
+    : target.htmlContent;
+  return evaluateHtmlExportSize(output);
 }
 
 /**
- * Exports the complete project HTML (concatenating all sections in displayed order)
+ * Exports the complete project HTML (including its active CSS stylesheet and all sections in displayed order)
  * along with its total character count and Fourthwall 30,000-character limit status.
  */
 export function exportCompleteProjectHtml(
   project: HtmlEditorProject,
-  catalogProducts: Product[] = []
+  catalogProducts: Product[] = [],
+  options?: { includeCss?: boolean; customCss?: string }
 ): HtmlExportPayload {
   const normalized = ensureProjectHasSections(project, catalogProducts);
   const fullHtml = joinProjectSectionsHtml(normalized.sections || []);
-  return evaluateHtmlExportSize(fullHtml);
+  const shouldIncludeCss =
+    options?.includeCss !== undefined
+      ? options.includeCss
+      : normalized.editorState?.includeFourthwallCss !== false;
+  const activeCss = options?.customCss ?? resolveProjectCss(normalized);
+  const combinedCode = buildFourthwallExportCode(fullHtml, activeCss, {
+    includeCss: shouldIncludeCss,
+  });
+  return evaluateHtmlExportSize(combinedCode);
 }
 
 
