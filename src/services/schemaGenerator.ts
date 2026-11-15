@@ -1,5 +1,6 @@
 import { FAQItem, GiftGuide, GuideSection, Product, ValidationIssue } from '../types/cms';
 import { extractCanonicalFaqsFromSections } from './htmlRenderer';
+import { normalizeFourthwallProductUrl } from './productCatalogTaxonomy';
 
 /**
  * Strips HTML tags from an answer string for clean plain-text or schema text representation,
@@ -22,14 +23,14 @@ export function stripHtmlToText(html: string): string {
  * Resolves a potentially relative Fourthwall URL (/products/...) against the configured site base URL.
  */
 export function resolveFullUrl(baseUrl: string, pathOrUrl: string): string {
-  const cleanPath = (pathOrUrl || '').trim();
+  const cleanPath = normalizeFourthwallProductUrl((pathOrUrl || '').trim());
   if (!cleanPath) return '';
   if (/^https?:\/\//i.test(cleanPath)) {
     return cleanPath;
   }
   const cleanBase = (baseUrl || 'https://scienceofgifts.com').trim().replace(/\/+$/, '');
   const normalizedPath = cleanPath.startsWith('/') ? cleanPath : `/${cleanPath}`;
-  return `${cleanBase}${normalizedPath}`;
+  return normalizeFourthwallProductUrl(`${cleanBase}${normalizedPath}`);
 }
 
 /**

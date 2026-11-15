@@ -43,16 +43,29 @@ import {
 import { buildEditorialSvgDataUri, SEED_PRODUCTS } from '../data/greekMythologySeed';
 import { getSavedGeminiModelPreference } from '../services/geminiModelConfig';
 import {
+  INITIAL_PRODUCT_CATEGORIES,
   MANAGED_PRODUCT_TYPES,
   ProductTypeDetectionResult,
   addManagedCategory,
+  deduplicateProductTags,
+  deleteManagedCategory,
   detectProductType,
   findCanonicalOption,
+  formatProductTagsInput,
   getUncatalogedProductCategories,
   isPlaceholderProductType,
   loadManagedCategories,
+  loadRememberedProductCategory,
+  loadRememberedProductTags,
+  loadReuseLastTagsPreference,
+  normalizeFourthwallProductUrl,
   normalizeTaxonomyLabel,
   renameManagedCategory,
+  resolveCategoryForProductModal,
+  resolveTagsForProductModal,
+  saveRememberedProductCategory,
+  saveRememberedProductTags,
+  saveReuseLastTagsPreference,
   toTaxonomyKey,
 } from '../services/productCatalogTaxonomy';
 
@@ -168,7 +181,7 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
   // Delete confirmation state
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
-  // Managed Categories & Product Type Detection UI state
+  // Managed Categories, Remembered Category & Tag Reuse, and Product Type Detection UI state
   const [managedCategories, setManagedCategories] = useState<string[]>(() =>
     loadManagedCategories()
   );
@@ -180,6 +193,18 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
   const [detectedTypeInfo, setDetectedTypeInfo] = useState<ProductTypeDetectionResult | null>(
     null
   );
+  const [categorySelectionSource, setCategorySelectionSource] = useState<
+    'existing_product' | 'remembered_category' | 'auto_detected' | 'default_fallback'
+  >('default_fallback');
+  const [initialModalCategory, setInitialModalCategory] = useState<string>('');
+  const [rememberedTags, setRememberedTags] = useState<string[]>(() =>
+    loadRememberedProductTags()
+  );
+  const [reuseLastTags, setReuseLastTags] = useState<boolean>(() =>
+    loadReuseLastTagsPreference()
+  );
+  const [modalExtractedTags, setModalExtractedTags] = useState<string[]>([]);
+  const [initialModalTagsInput, setInitialModalTagsInput] = useState<string>('');
 
   const uncatalogedCategories = useMemo(
     () => getUncatalogedProductCategories(products, managedCategories),
@@ -300,7 +325,9 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
     existingMatch?: Product
   ) => {
     const nowIso = new Date().toISOString();
-    const resolvedUrl = extracted.productUrl || sourceUrl;
+    const rawResolvedUrl = extracted.productUrl || sourceUrl;
+    const resolvedUrl =
+      normalizeFourthwallProductUrl(rawResolvedUrl) || rawResolvedUrl;
     const id = existingMatch
       ? existingMatch.id
       : deriveStableProductId(
@@ -309,9 +336,29 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
           products.length + 1
         );
 
-    const initialTags = existingMatch
-      ? Array.from(new Set([...(existingMatch.tags || []), ...(extracted.tags || [])]))
-      : extracted.tags || [];
+    const latestManagedCats = loadManagedCategories();
+    setManagedCategories(latestManagedCats);
+    const latestRememberedTags = loadRememberedProductTags();
+    setRememberedTags(latestRememberedTags);
+    const latestReuseEnabled = loadReuseLastTagsPreference();
+    setReuseLastTags(latestReuseEnabled);
+
+    const categoryResolution = resolveCategoryForProductModal({
+      isExistingEdit: Boolean(existingMatch),
+      existingCategory: existingMatch?.category,
+      extractedCategory: extracted.category,
+      managedCategories: latestManagedCats,
+    });
+    const resolvedCategory = categoryResolution.category;
+
+    const tagsResolution = resolveTagsForProductModal({
+      isExistingEdit: Boolean(existingMatch),
+      existingTags: existingMatch?.tags,
+      extractedTags: extracted.tags,
+      rememberedTags: latestRememberedTags,
+      reuseLastTagsEnabled: latestReuseEnabled,
+    });
+    const initialTags = tagsResolution.tags;
 
     const extraImgs = (extracted.imageUrls || []).filter((u) => u !== extracted.imageUrl);
 
@@ -333,7 +380,7 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       category: extracted.category || existingMatch?.category,
       shortDescription: resolvedDesc,
       featuresSpecs: resolvedSpecs,
-      tags: initialTags,
+      tags: extracted.tags || existingMatch?.tags || [],
     });
 
     const resolvedProductType = hasConfirmedExistingType
@@ -342,15 +389,6 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       : localDetection.isConfident
       ? localDetection.detectedType
       : 'Other';
-
-    const rawExtractedCat = normalizeTaxonomyLabel(extracted.category || '');
-    const rawExistingCat = normalizeTaxonomyLabel(existingMatch?.category || '');
-    const resolvedCategory =
-      rawExistingCat && toTaxonomyKey(rawExistingCat) !== 'general'
-        ? findCanonicalOption(rawExistingCat, managedCategories) || rawExistingCat
-        : rawExtractedCat
-        ? findCanonicalOption(rawExtractedCat, managedCategories) || rawExtractedCat
-        : 'General History';
 
     setEditingProduct({
       id,
@@ -379,10 +417,14 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       archived: existingMatch?.archived || false,
     });
     setDetectedTypeInfo(localDetection);
+    setCategorySelectionSource(categoryResolution.source);
+    setInitialModalCategory(resolvedCategory);
     setCategorySearchFilter('');
     setShowAddCategoryInline(false);
     setShowRenameCategoryInline(false);
-    setTagsInput(initialTags.join(', '));
+    setModalExtractedTags(tagsResolution.extractedTags);
+    setTagsInput(tagsResolution.tagsInput);
+    setInitialModalTagsInput(tagsResolution.tagsInput);
     setAdditionalImagesInput(extraImgs.join('\n'));
     setIsExistingEdit(Boolean(existingMatch));
     setExtractionWarnings(extracted.warnings || []);
@@ -391,7 +433,7 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
 
   // Resolve relative `/products/...` URL using defaultStoreBaseUrl when fetching
   const resolveFullUrlForFetch = (rawInput: string): string => {
-    const trimmed = rawInput.trim();
+    const trimmed = normalizeFourthwallProductUrl(rawInput.trim());
     if (trimmed.startsWith('/')) {
       return `${defaultStoreBaseUrl.replace(/\/+$/, '')}${trimmed}`;
     }
@@ -412,9 +454,14 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       return;
     }
 
+    const normalizedInputUrl = normalizeFourthwallProductUrl(rawTrimmed) || rawTrimmed;
+    if (normalizedInputUrl !== fetchUrlInput) {
+      setFetchUrlInput(normalizedInputUrl);
+    }
+
     // Check for duplicate in catalog before fetching
     if (!options.forceIgnoreDuplicate) {
-      const existingDup = findDuplicateProduct(products, rawTrimmed);
+      const existingDup = findDuplicateProduct(products, normalizedInputUrl);
       if (existingDup) {
         setDuplicateWarningProduct(existingDup);
         return;
@@ -422,7 +469,10 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
     }
     setDuplicateWarningProduct(null);
 
-    const fullFetchUrl = resolveFullUrlForFetch(rawTrimmed);
+    const fullFetchUrl = resolveFullUrlForFetch(normalizedInputUrl);
+    const originalFullFetchUrl = rawTrimmed.startsWith('/')
+      ? `${defaultStoreBaseUrl.replace(/\/+$/, '')}${rawTrimmed}`
+      : rawTrimmed;
     const check = validateFetchableProductUrl(fullFetchUrl);
     if (!check.valid) {
       setFetchError(check.error || 'Invalid URL.');
@@ -436,6 +486,8 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           url: check.normalizedUrl,
+          originalUrl:
+            originalFullFetchUrl !== check.normalizedUrl ? originalFullFetchUrl : undefined,
           useAiFallback: Boolean(options.useAiFallback),
           preferredModel: options.useAiFallback ? getSavedGeminiModelPreference() : undefined,
         }),
@@ -453,7 +505,7 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
 
       const extracted = data.extracted as ExtractedProductData;
       const existingDup = findDuplicateProduct(products, extracted.productUrl, extracted.sku);
-      openReviewModalFromExtracted(extracted, rawTrimmed, existingDup);
+      openReviewModalFromExtracted(extracted, normalizedInputUrl, existingDup);
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'Network error while fetching URL.');
       setShowPasteFallbackBox(true);
@@ -551,11 +603,30 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
   };
 
   const openNewProductModal = (prefillUrl = '') => {
-    const initialDetection = detectProductType({ productUrl: prefillUrl });
+    const normalizedPrefill =
+      normalizeFourthwallProductUrl(prefillUrl.trim()) || prefillUrl.trim();
+    const latestManagedCats = loadManagedCategories();
+    setManagedCategories(latestManagedCats);
+    const latestRememberedTags = loadRememberedProductTags();
+    setRememberedTags(latestRememberedTags);
+    const latestReuseEnabled = loadReuseLastTagsPreference();
+    setReuseLastTags(latestReuseEnabled);
+
+    const categoryResolution = resolveCategoryForProductModal({
+      isExistingEdit: false,
+      managedCategories: latestManagedCats,
+    });
+    const tagsResolution = resolveTagsForProductModal({
+      isExistingEdit: false,
+      rememberedTags: latestRememberedTags,
+      reuseLastTagsEnabled: latestReuseEnabled,
+    });
+
+    const initialDetection = detectProductType({ productUrl: normalizedPrefill });
     setEditingProduct({
       id: '',
       name: '',
-      productUrl: prefillUrl || '/products/',
+      productUrl: normalizedPrefill || '/products/',
       imageUrl: '',
       imageUrls: [],
       price: '',
@@ -563,9 +634,9 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       currency: 'USD',
       productType: initialDetection.isConfident ? initialDetection.detectedType : 'Other',
       productTypeManualOverride: false,
-      category: managedCategories[0] || 'General History',
+      category: categoryResolution.category || latestManagedCats[0] || 'General History',
       sku: '',
-      tags: [],
+      tags: tagsResolution.tags,
       shortDescription: '',
       featuresSpecs: '',
       sourceNotes: '',
@@ -576,10 +647,14 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       archived: false,
     });
     setDetectedTypeInfo(initialDetection);
+    setCategorySelectionSource(categoryResolution.source);
+    setInitialModalCategory(categoryResolution.category);
     setCategorySearchFilter('');
     setShowAddCategoryInline(false);
     setShowRenameCategoryInline(false);
-    setTagsInput('');
+    setModalExtractedTags([]);
+    setTagsInput(tagsResolution.tagsInput);
+    setInitialModalTagsInput(tagsResolution.tagsInput);
     setAdditionalImagesInput('');
     setExtractionWarnings([]);
     setIsExistingEdit(false);
@@ -587,10 +662,12 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
   };
 
   const openEditProductModal = (prod: Product) => {
+    const normalizedProdUrl =
+      normalizeFourthwallProductUrl(prod.productUrl) || prod.productUrl;
     const extraImgs = (prod.imageUrls || []).filter((u) => u !== prod.imageUrl);
     const localDetection = detectProductType({
       name: prod.name,
-      productUrl: prod.productUrl,
+      productUrl: normalizedProdUrl,
       shortDescription: prod.shortDescription,
       featuresSpecs: prod.featuresSpecs,
       tags: prod.tags,
@@ -603,15 +680,29 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       ? localDetection.detectedType
       : 'Other';
 
-    const cleanCat = normalizeTaxonomyLabel(prod.category);
-    const resolvedCat = cleanCat
-      ? findCanonicalOption(cleanCat, managedCategories) || cleanCat
-      : 'General History';
+    const latestManagedCats = loadManagedCategories();
+    setManagedCategories(latestManagedCats);
+    const latestRememberedTags = loadRememberedProductTags();
+    setRememberedTags(latestRememberedTags);
+    const latestReuseEnabled = loadReuseLastTagsPreference();
+    setReuseLastTags(latestReuseEnabled);
+
+    const categoryResolution = resolveCategoryForProductModal({
+      isExistingEdit: true,
+      existingCategory: prod.category,
+      managedCategories: latestManagedCats,
+    });
+    const tagsResolution = resolveTagsForProductModal({
+      isExistingEdit: true,
+      existingTags: prod.tags,
+      rememberedTags: latestRememberedTags,
+      reuseLastTagsEnabled: latestReuseEnabled,
+    });
 
     setEditingProduct({
       id: prod.id,
       name: prod.name,
-      productUrl: prod.productUrl,
+      productUrl: normalizedProdUrl,
       imageUrl: prod.imageUrl,
       imageUrls: prod.imageUrls || [],
       price: prod.price === 'Unavailable' ? '' : prod.price,
@@ -621,9 +712,9 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       productTypeManualOverride: hasExistingSpecificType
         ? prod.productTypeManualOverride ?? true
         : false,
-      category: resolvedCat,
+      category: categoryResolution.category,
       sku: prod.sku || '',
-      tags: prod.tags || [],
+      tags: tagsResolution.tags,
       shortDescription: prod.shortDescription,
       featuresSpecs: prod.featuresSpecs,
       sourceNotes: prod.sourceNotes,
@@ -634,10 +725,14 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
       archived: prod.archived,
     });
     setDetectedTypeInfo(localDetection);
+    setCategorySelectionSource('existing_product');
+    setInitialModalCategory(categoryResolution.category);
     setCategorySearchFilter('');
     setShowAddCategoryInline(false);
     setShowRenameCategoryInline(false);
-    setTagsInput((prod.tags || []).join(', '));
+    setModalExtractedTags([]);
+    setTagsInput(tagsResolution.tagsInput);
+    setInitialModalTagsInput(tagsResolution.tagsInput);
     setAdditionalImagesInput(extraImgs.join('\n'));
     setExtractionWarnings([]);
     setIsExistingEdit(true);
@@ -649,7 +744,9 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
     if (!editingProduct) return;
 
     const name = editingProduct.name.trim();
-    const url = editingProduct.productUrl.trim();
+    const url =
+      normalizeFourthwallProductUrl(editingProduct.productUrl.trim()) ||
+      editingProduct.productUrl.trim();
     const rawPrice = editingProduct.price.trim();
 
     if (!name) {
@@ -683,11 +780,7 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
 
     const finalId =
       editingProduct.id.trim() || deriveStableProductId(url, name, products.length + 1);
-    const parsedTags = tagsInput
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean)
-      .slice(0, 20);
+    const parsedTags = deduplicateProductTags(tagsInput);
 
     const extraImgs = additionalImagesInput
       .split(/\r?\n|,/)
@@ -732,6 +825,22 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
         },
         isExistingEdit
       );
+
+      // Remember selected category for subsequent imports when saving a new product or when the user changed the category
+      if (!isExistingEdit || toTaxonomyKey(finalCategory) !== toTaxonomyKey(initialModalCategory)) {
+        saveRememberedProductCategory(finalCategory, managedCategories);
+      }
+
+      // Remember saved tags for subsequent imports when saving a new product or when the user edited the tags
+      const formattedCurrentTags = formatProductTagsInput(parsedTags);
+      if (
+        (!isExistingEdit && parsedTags.length > 0) ||
+        (isExistingEdit && formattedCurrentTags !== initialModalTagsInput)
+      ) {
+        const savedTagSet = saveRememberedProductTags(parsedTags);
+        setRememberedTags(savedTagSet);
+      }
+
       setEditingProduct(null);
       setFetchUrlInput('');
     } catch (err) {
@@ -883,10 +992,18 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
             type="text"
             value={fetchUrlInput}
             onChange={(e) => {
-              setFetchUrlInput(e.target.value);
+              const rawVal = e.target.value;
+              const normalizedVal = normalizeFourthwallProductUrl(rawVal) || rawVal;
+              setFetchUrlInput(normalizedVal);
               if (duplicateWarningProduct) setDuplicateWarningProduct(null);
             }}
-            placeholder="Paste Fourthwall or store product URL (e.g., https://scienceofgifts.com/products/hades-underworld-tee)..."
+            onBlur={() => {
+              const normalizedVal = normalizeFourthwallProductUrl(fetchUrlInput);
+              if (normalizedVal && normalizedVal !== fetchUrlInput) {
+                setFetchUrlInput(normalizedVal);
+              }
+            }}
+            placeholder="Paste Fourthwall or store product URL (e.g., https://shop.scienceofgifts.com/products/hades-underworld-tee)..."
             className="flex-1 min-w-[260px] px-3.5 py-2 text-xs font-mono-tabular bg-white border border-[#94C0D6] rounded-lg text-[#111A27] focus:outline-none focus:border-[#123E59]"
           />
           <button
@@ -1530,7 +1647,9 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
                     required
                     value={editingProduct.productUrl}
                     onChange={(e) => {
-                      const nextUrl = e.target.value;
+                      const rawNextUrl = e.target.value;
+                      const nextUrl =
+                        normalizeFourthwallProductUrl(rawNextUrl) || rawNextUrl;
                       const nextDetection = detectProductType({
                         name: editingProduct.name,
                         productUrl: nextUrl,
@@ -1547,6 +1666,17 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
                           ? nextDetection.detectedType
                           : editingProduct.productType || 'Other',
                       });
+                    }}
+                    onBlur={() => {
+                      const normalized = normalizeFourthwallProductUrl(
+                        editingProduct.productUrl
+                      );
+                      if (normalized && normalized !== editingProduct.productUrl) {
+                        setEditingProduct({
+                          ...editingProduct,
+                          productUrl: normalized,
+                        });
+                      }
                     }}
                     placeholder="/products/hades-greek-mythology-shirt-ruler-of-the-underworld-t-shirt"
                     className="sog-input font-mono-tabular"
@@ -1624,6 +1754,37 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
                           Rename
                         </button>
                       )}
+                      {editingProduct.category &&
+                        !findCanonicalOption(
+                          editingProduct.category,
+                          INITIAL_PRODUCT_CATEGORIES
+                        ) &&
+                        findCanonicalOption(editingProduct.category, managedCategories) && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const removedName = editingProduct.category;
+                              const res = deleteManagedCategory(removedName, managedCategories);
+                              setManagedCategories(res.categories);
+                              const fallbackCat =
+                                loadRememberedProductCategory(res.categories) ||
+                                res.categories[0] ||
+                                'General History';
+                              setEditingProduct({
+                                ...editingProduct,
+                                category: fallbackCat,
+                              });
+                              setCategorySelectionSource('default_fallback');
+                              onShowToast?.(
+                                `Removed "${removedName}" from managed categories.`
+                              );
+                            }}
+                            className="text-[#5E6B7C] hover:text-red-700 hover:underline"
+                            title="Remove this custom category from managed options"
+                          >
+                            Remove
+                          </button>
+                        )}
                     </div>
                   </div>
 
@@ -1638,9 +1799,10 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
                     />
                     <select
                       value={editingProduct.category}
-                      onChange={(e) =>
-                        setEditingProduct({ ...editingProduct, category: e.target.value })
-                      }
+                      onChange={(e) => {
+                        setEditingProduct({ ...editingProduct, category: e.target.value });
+                        setCategorySelectionSource('remembered_category');
+                      }}
                       aria-label="Category / Theme"
                       className="sog-input"
                     >
@@ -1846,6 +2008,11 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
                         </div>
                       </div>
                     )}
+                    {!isExistingEdit && categorySelectionSource === 'remembered_category' && (
+                      <p className="text-[11px] text-[#134634]">
+                        Remembered from last saved product (will update when saved)
+                      </p>
+                    )}
                   </div>
                 </div>
 
@@ -1924,14 +2091,133 @@ export const ProductLibraryView: React.FC<ProductLibraryViewProps> = ({
                 </div>
 
                 <div>
-                  <label className="sog-label">Tags (comma-separated)</label>
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <label className="sog-label mb-0">Tags (comma-separated)</label>
+                    <div className="flex items-center gap-2 text-[11px]">
+                      <label className="inline-flex items-center gap-1 cursor-pointer text-[#334155] select-none">
+                        <input
+                          type="checkbox"
+                          checked={reuseLastTags}
+                          onChange={(e) => {
+                            const nextEnabled = e.target.checked;
+                            setReuseLastTags(nextEnabled);
+                            saveReuseLastTagsPreference(nextEnabled);
+                            if (!isExistingEdit && rememberedTags.length > 0) {
+                              const currentClean = formatProductTagsInput(tagsInput);
+                              const rememberedClean = formatProductTagsInput(rememberedTags);
+                              const extractedClean = formatProductTagsInput(modalExtractedTags);
+                              if (nextEnabled && (!currentClean || currentClean === extractedClean)) {
+                                if (modalExtractedTags.length === 0) {
+                                  setTagsInput(rememberedClean);
+                                }
+                              } else if (!nextEnabled && currentClean === rememberedClean) {
+                                setTagsInput(extractedClean);
+                              }
+                            }
+                          }}
+                          className="rounded border-[#B8B0A0]"
+                        />
+                        <span className="font-semibold">Reuse last tags</span>
+                      </label>
+                      {tagsInput.trim() && (
+                        <button
+                          type="button"
+                          onClick={() => setTagsInput('')}
+                          className="text-[#5E6B7C] hover:text-[#111A27] hover:underline"
+                          title="Clear current tags"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
                   <input
                     type="text"
                     value={tagsInput}
                     onChange={(e) => setTagsInput(e.target.value)}
+                    onBlur={() => {
+                      const deduped = formatProductTagsInput(tagsInput);
+                      if (deduped !== tagsInput) {
+                        setTagsInput(deduped);
+                      }
+                    }}
                     placeholder="hades, underworld, apparel"
                     className="sog-input"
                   />
+
+                  {/* Reversible tag helper when remembered tags exist */}
+                  {rememberedTags.length > 0 && (
+                    <div className="mt-1 text-[11px] text-[#5E6B7C] space-y-1">
+                      {!isExistingEdit && modalExtractedTags.length > 0 ? (
+                        <div className="p-1.5 bg-[#EFF6FA] border border-[#94C0D6] rounded text-[#123E59] space-y-1">
+                          <div className="flex flex-wrap items-center justify-between gap-1">
+                            <span>
+                              Extracted product tags kept distinct from last saved tags (
+                              <span className="font-mono-tabular">
+                                {rememberedTags.join(', ')}
+                              </span>
+                              ).
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setTagsInput(formatProductTagsInput(rememberedTags))
+                              }
+                              className="font-semibold underline hover:text-[#111A27]"
+                            >
+                              Use Last Tags Instead
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setTagsInput(
+                                  formatProductTagsInput([
+                                    ...modalExtractedTags,
+                                    ...rememberedTags,
+                                  ])
+                                )
+                              }
+                              className="font-semibold underline hover:text-[#111A27]"
+                            >
+                              Merge Last Tags
+                            </button>
+                            {formatProductTagsInput(tagsInput) !==
+                              formatProductTagsInput(modalExtractedTags) && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setTagsInput(formatProductTagsInput(modalExtractedTags))
+                                }
+                                className="font-semibold text-amber-900 underline hover:text-[#111A27]"
+                              >
+                                Revert to Extracted Tags
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap items-center justify-between gap-1">
+                          <span className="truncate">
+                            Last saved: {rememberedTags.join(', ')}
+                          </span>
+                          {formatProductTagsInput(tagsInput) !==
+                            formatProductTagsInput(rememberedTags) && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setTagsInput(formatProductTagsInput(rememberedTags))
+                              }
+                              className="font-semibold text-[#1A567B] hover:underline shrink-0"
+                            >
+                              Apply Last Tags
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 <div className="md:col-span-3">

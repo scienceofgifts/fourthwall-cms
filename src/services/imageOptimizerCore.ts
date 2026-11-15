@@ -11,6 +11,7 @@ import {
   parseHtmlToAst,
   serializeAstToHtml,
 } from './htmlWorkspaceEngine';
+import { normalizeFourthwallProductUrl } from './productCatalogTaxonomy';
 
 export const DEFAULT_CUSTOM_IMAGE_DOMAIN = 'https://images.scienceofgifts.com';
 export const DEFAULT_IMAGE_PUBLIC_BASE_URL = DEFAULT_CUSTOM_IMAGE_DOMAIN;
@@ -95,7 +96,7 @@ export function normalizeCustomImageDomain(rawDomain: string): string {
  * Never uses AI to invent slugs or URLs.
  */
 export function deriveProductSlugFromUrl(productPageUrl: string, fallbackName = ''): string {
-  const raw = (productPageUrl || '').trim();
+  const raw = normalizeFourthwallProductUrl((productPageUrl || '').trim());
   let candidate = '';
 
   if (raw) {
@@ -658,11 +659,13 @@ export function scanGuideHtmlForImages(
       catalogProducts
     );
 
-    const productPageUrl =
+    const rawProductPageUrl =
       existingByUrl?.productPageUrl ||
       matchedProduct?.productUrl ||
       det.enclosingHref ||
       '';
+    const productPageUrl =
+      normalizeFourthwallProductUrl(rawProductPageUrl) || rawProductPageUrl;
 
     const baseProductSlug =
       existingByUrl?.baseProductSlug ||

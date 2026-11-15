@@ -1,7 +1,9 @@
 import { Product } from '../types/cms';
 import {
+  deduplicateProductTags,
   detectProductType,
   isPlaceholderProductType,
+  normalizeFourthwallProductUrl,
   normalizeTaxonomyLabel,
 } from './productCatalogTaxonomy';
 import { ExtractedProductData } from './productExtractor';
@@ -16,10 +18,11 @@ export interface BriefGenerationOptions {
 
 /**
  * Normalizes a product URL for duplicate detection and catalog matching.
- * Treats `/products/foo-bar` and `https://scienceofgifts.com/products/foo-bar?variant=123` as matching the `/products/foo-bar` path.
+ * Treats `/products/foo-bar`, `/en-usd/products/foo-bar`, and `https://shop.scienceofgifts.com/en-usd/products/foo-bar?variant=123`
+ * as matching the canonical `/products/foo-bar` path.
  */
 export function normalizeProductUrlForMatch(rawUrl: string): string {
-  const trimmed = (rawUrl || '').trim();
+  const trimmed = normalizeFourthwallProductUrl((rawUrl || '').trim());
   if (!trimmed) return '';
   try {
     if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
@@ -199,19 +202,23 @@ export function mergeRefreshedProductData(
       ? extracted.variants
       : existing.variants || [];
 
-  // Always preserve user custom notes and combine tags
-  const combinedTags = Array.from(
-    new Set([...(existing.tags || []), ...(extracted.tags || [])])
-  ).slice(0, 20);
+  // Always preserve user custom notes and combine tags cleanly
+  const combinedTags = deduplicateProductTags([
+    ...(existing.tags || []),
+    ...(extracted.tags || []),
+  ]);
 
   if (existing.sourceNotes?.trim()) {
     preservedFields.push('Custom Notes');
   }
 
   const nowIso = new Date().toISOString();
+  const normalizedExistingUrl =
+    normalizeFourthwallProductUrl(existing.productUrl) || existing.productUrl;
 
   const mergedProduct: Product = {
     ...existing,
+    productUrl: normalizedExistingUrl,
     name: mergedName,
     price: mergedPrice,
     originalPrice: mergedOriginalPrice || undefined,
@@ -285,7 +292,7 @@ export function generateProductBrief(
       lines.push(`- Title: ${cleanTitle}`);
     }
 
-    const cleanUrl = (prod.productUrl || '').trim();
+    const cleanUrl = normalizeFourthwallProductUrl((prod.productUrl || '').trim());
     if (cleanUrl) {
       lines.push(`- Product URL: ${cleanUrl}`);
     }

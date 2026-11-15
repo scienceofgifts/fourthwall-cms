@@ -8,6 +8,7 @@ import {
   ValidationIssue,
 } from '../types/cms';
 import { buildEditorialSvgDataUri } from '../data/greekMythologySeed';
+import { normalizeFourthwallProductUrl } from './productCatalogTaxonomy';
 
 /**
  * Escapes plain text for safe insertion into HTML text nodes and attribute values.
@@ -89,7 +90,8 @@ function renderMoreGiftsCardsHtml(
   return sorted
     .map((item) => {
       const product = findProduct(productsMap, item.productId);
-      const url = (item.productUrlOverride || product?.productUrl || '#').trim();
+      const rawUrl = (item.productUrlOverride || product?.productUrl || '#').trim();
+      const url = normalizeFourthwallProductUrl(rawUrl) || rawUrl;
       const img = (item.imageUrlOverride || product?.imageUrl || '').trim();
       const title = (item.displayTitle || product?.name || 'Untitled Product').trim();
       const desc = (item.description || product?.shortDescription || '').trim();
@@ -213,7 +215,8 @@ ${listItems}
       const cardsHtml = cards
         .map((card) => {
           const product = findProduct(productsMap, card.productId);
-          const url = (card.productUrlOverride || product?.productUrl || '#').trim();
+          const rawUrl = (card.productUrlOverride || product?.productUrl || '#').trim();
+          const url = normalizeFourthwallProductUrl(rawUrl) || rawUrl;
           const img = (card.imageUrlOverride || product?.imageUrl || '').trim();
           const title = (card.displayTitle || product?.name || 'Untitled Product').trim();
           const badge = (card.badgeText || 'Top Pick').trim();
@@ -254,7 +257,8 @@ ${cardsHtml}
     case 'editors_pick': {
       const ep = cfg.editorsPick;
       const product = ep?.productId ? findProduct(productsMap, ep.productId) : undefined;
-      const url = (ep?.productUrlOverride || product?.productUrl || '#').trim();
+      const rawUrl = (ep?.productUrlOverride || product?.productUrl || '#').trim();
+      const url = normalizeFourthwallProductUrl(rawUrl) || rawUrl;
       const img = (ep?.imageUrlOverride || product?.imageUrl || '').trim();
       const kicker = (ep?.kicker || '🏆 Our #1 Pick').trim();
       const heading = (ep?.heading || product?.name || section.title).trim();
@@ -293,7 +297,8 @@ ${cardsHtml}
       const cardsHtml = items
         .map((item, idx) => {
           const product = findProduct(productsMap, item.productId);
-          const url = (item.productUrlOverride || product?.productUrl || '#').trim();
+          const rawUrl = (item.productUrlOverride || product?.productUrl || '#').trim();
+          const url = normalizeFourthwallProductUrl(rawUrl) || rawUrl;
           const img = (item.imageUrlOverride || product?.imageUrl || '').trim();
           const title = (item.displayTitle || product?.name || 'Untitled Product').trim();
           const numBadge = (item.rankNumber || `#${String(idx + 1).padStart(2, '0')}`).trim();
@@ -425,20 +430,23 @@ ${cardsHtml}
           const thumbProduct = card.thumbnailProductId
             ? findProduct(productsMap, card.thumbnailProductId)
             : undefined;
-          const thumbProductUrl = (
+          const rawThumbProductUrl = (
             card.thumbnailUrlOverride ||
             thumbProduct?.productUrl ||
             card.links?.[0]?.urlOverride ||
             findProduct(productsMap, card.links?.[0]?.productId || '')?.productUrl ||
             '#'
           ).trim();
+          const thumbProductUrl =
+            normalizeFourthwallProductUrl(rawThumbProductUrl) || rawThumbProductUrl;
           const thumbImgUrl = (thumbProduct?.imageUrl || '').trim();
           const thumbAlt = (card.thumbnailAlt || `${card.categoryName} gifts`).trim();
 
           const chipsHtml = (card.links || [])
             .map((lnk) => {
               const linkedProd = findProduct(productsMap, lnk.productId);
-              const href = (lnk.urlOverride || linkedProd?.productUrl || '#').trim();
+              const rawHref = (lnk.urlOverride || linkedProd?.productUrl || '#').trim();
+              const href = normalizeFourthwallProductUrl(rawHref) || rawHref;
               const label = (lnk.label || linkedProd?.name || 'View Gift').trim();
               return `          <a href="${escapeHtml(href)}" class="sog-deity-chip">${escapeHtml(label)}</a>`;
             })

@@ -1,12 +1,16 @@
 import { Product } from '../types/cms';
 import {
   MANAGED_PRODUCT_TYPES,
+  deduplicateProductTags,
   detectProductType,
   findCanonicalOption,
   isPlaceholderProductType,
   loadManagedCategories,
+  normalizeFourthwallProductUrl,
   normalizeTaxonomyLabel,
 } from './productCatalogTaxonomy';
+
+export { normalizeFourthwallProductUrl };
 
 export interface ParsedProductRow {
   rowNumber: number;
@@ -54,13 +58,13 @@ function parseCsvLine(line: string, delimiter = ','): string[] {
 
 /**
  * Validates a product URL (either a Fourthwall relative path like `/products/...` or a full `https://...` URL).
- * Preserves the exact user-supplied slug without rewriting it.
+ * Normalizes Fourthwall `/en-usd` locale prefixes before validating while preserving the exact product slug.
  */
 export function isValidProductUrl(url: string): boolean {
-  const trimmed = (url || '').trim();
+  const trimmed = normalizeFourthwallProductUrl((url || '').trim());
   if (!trimmed || trimmed.length > 1000) return false;
   if (trimmed.startsWith('/')) {
-    return /^\/[a-zA-Z0-9\-._~%!$&'()*+,;=:@/]+$/.test(trimmed);
+    return /^\/[a-zA-Z0-9\-._~%!$&'()*+,;=:@/?#]+$/.test(trimmed);
   }
   try {
     const parsed = new URL(trimmed);
@@ -91,7 +95,8 @@ export function normalizePriceDisplay(rawPrice: string): { valid: boolean; forma
  * Generates a deterministic stable product ID from its URL slug or name.
  */
 export function deriveStableProductId(productUrl: string, name: string, fallbackIndex: number): string {
-  const slugMatch = productUrl.match(/\/products\/([a-zA-Z0-9\-_]+)/);
+  const normUrl = normalizeFourthwallProductUrl(productUrl);
+  const slugMatch = normUrl.match(/\/products\/([a-zA-Z0-9\-_]+)/);
   const rawBase = slugMatch ? slugMatch[1] : name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
   const cleaned = rawBase.replace(/^-+|-+$/g, '').slice(0, 80);
   return cleaned ? `prod-${cleaned}` : `prod-item-${fallbackIndex}`;
@@ -167,7 +172,8 @@ export function parseProductImportBatch(rawInput: string): ProductImportReport {
     };
 
     const name = getCol(['name', 'title', 'productname'], 0);
-    const productUrl = getCol(['producturl', 'url', 'link', 'href'], 1);
+    const rawProductUrl = getCol(['producturl', 'url', 'link', 'href'], 1);
+    const productUrl = normalizeFourthwallProductUrl(rawProductUrl);
     const rawPrice = getCol(['price', 'cost'], 2);
     const rawProductTypeCol = normalizeTaxonomyLabel(getCol(['producttype', 'type'], 3));
     const rawCategoryCol = normalizeTaxonomyLabel(getCol(['category', 'deity', 'theme', 'era'], 4));
@@ -182,7 +188,7 @@ export function parseProductImportBatch(rawInput: string): ProductImportReport {
     if (!productUrl) {
       errors.push('Missing product URL.');
     } else if (!isValidProductUrl(productUrl)) {
-      errors.push(`Invalid product URL "${productUrl}". Use a relative path (/products/...) or full https:// URL.`);
+      errors.push(`Invalid product URL "${rawProductUrl}". Use a relative path (/products/...) or full https:// URL.`);
     }
 
     const priceCheck = normalizePriceDisplay(rawPrice);
@@ -218,12 +224,8 @@ export function parseProductImportBatch(rawInput: string): ProductImportReport {
         }).detectedType;
 
     const tags = rawTags
-      ? rawTags
-          .split(/[;|,]/)
-          .map((t) => t.trim())
-          .filter(Boolean)
-          .slice(0, 20)
-      : [category.toLowerCase(), productType.toLowerCase()].filter(Boolean);
+      ? deduplicateProductTags(rawTags.split(/[;|,]/))
+      : deduplicateProductTags([category.toLowerCase(), productType.toLowerCase()]);
 
     validProducts.push({
       id: deriveStableProductId(productUrl, name, rowNumber),

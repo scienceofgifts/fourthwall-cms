@@ -173,7 +173,7 @@ function concatUint8Arrays(chunks: Uint8Array[], totalLength: number): Uint8Arra
  */
 export async function fetchPublicProductHtmlSafely(
   initialUrl: string,
-  options?: ApiHandlerOptions
+  options?: ApiHandlerOptions & { preserveLocalizedUrl?: boolean }
 ): Promise<{
   html: string;
   finalUrl: string;
@@ -181,13 +181,17 @@ export async function fetchPublicProductHtmlSafely(
 }> {
   let currentUrl = initialUrl;
   const maxRedirects = 3;
+  const fetchFn = options?.customFetch || fetch;
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const check = validateFetchableProductUrl(currentUrl);
-    if (!check.valid || !check.normalizedUrl) {
+    const targetFetchUrl = options?.preserveLocalizedUrl
+      ? check.originalFetchUrl || check.normalizedUrl
+      : check.normalizedUrl;
+    if (!check.valid || !targetFetchUrl) {
       throw new Error(check.error || 'Unsafe URL blocked.');
     }
-    const parsed = new URL(check.normalizedUrl);
+    const parsed = new URL(targetFetchUrl);
     if (isPrivateOrInternalHost(parsed.hostname)) {
       throw new Error('Target host is restricted (private or internal network).');
     }
@@ -199,7 +203,7 @@ export async function fetchPublicProductHtmlSafely(
     const timer = setTimeout(() => controller.abort(), 10000);
 
     try {
-      const response = await fetch(parsed.toString(), {
+      const response = await fetchFn(parsed.toString(), {
         method: 'GET',
         redirect: 'manual',
         signal: controller.signal,
@@ -424,6 +428,7 @@ export async function handleProductFetchUrlRequest(
   options?: ApiHandlerOptions
 ): Promise<ApiHandlerResult> {
   const rawUrl = String(body?.url || '').trim();
+  const rawOriginalUrl = typeof body?.originalUrl === 'string' ? body.originalUrl.trim() : '';
   const useAiFallback = Boolean(body?.useAiFallback);
   const preferredModel = typeof body?.preferredModel === 'string' ? body.preferredModel : undefined;
 
@@ -438,12 +443,40 @@ export async function handleProductFetchUrlRequest(
     };
   }
 
+  let fallbackLocalizedUrl = urlCheck.originalFetchUrl;
+  if (!fallbackLocalizedUrl && rawOriginalUrl && rawOriginalUrl !== urlCheck.normalizedUrl) {
+    const origCheck = validateFetchableProductUrl(rawOriginalUrl);
+    if (origCheck.valid && origCheck.originalFetchUrl) {
+      fallbackLocalizedUrl = origCheck.originalFetchUrl;
+    }
+  }
+
   try {
-    const { html, finalUrl } = await fetchPublicProductHtmlSafely(
-      urlCheck.normalizedUrl,
-      options
-    );
-    let extracted = extractProductFromHtml(html, finalUrl);
+    let html: string;
+    let fetchedFinalUrl: string;
+    try {
+      const primaryRes = await fetchPublicProductHtmlSafely(
+        urlCheck.normalizedUrl,
+        options
+      );
+      html = primaryRes.html;
+      fetchedFinalUrl = primaryRes.finalUrl;
+    } catch (primaryErr) {
+      if (fallbackLocalizedUrl && fallbackLocalizedUrl !== urlCheck.normalizedUrl) {
+        const retryRes = await fetchPublicProductHtmlSafely(fallbackLocalizedUrl, {
+          ...options,
+          preserveLocalizedUrl: true,
+        });
+        html = retryRes.html;
+        fetchedFinalUrl = retryRes.finalUrl;
+      } else {
+        throw primaryErr;
+      }
+    }
+
+    const canonicalUrl =
+      extractProductFromHtml('', fetchedFinalUrl).productUrl || urlCheck.normalizedUrl;
+    let extracted = extractProductFromHtml(html, canonicalUrl);
     let modelMetadata: GeminiExecutionMetadata | undefined;
 
     if (
@@ -452,7 +485,7 @@ export async function handleProductFetchUrlRequest(
     ) {
       const aiRes = await runAiProductExtractionFallback(
         html,
-        finalUrl,
+        canonicalUrl,
         extracted,
         env,
         preferredModel,
@@ -466,7 +499,7 @@ export async function handleProductFetchUrlRequest(
       status: 200,
       body: {
         ok: true,
-        finalUrl,
+        finalUrl: extracted.productUrl || canonicalUrl,
         extracted,
         ...(modelMetadata ? { modelMetadata } : {}),
       },

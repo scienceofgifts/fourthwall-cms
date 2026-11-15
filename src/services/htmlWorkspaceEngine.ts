@@ -7,6 +7,7 @@ import {
 import { buildEditorialSvgDataUri } from '../data/greekMythologySeed';
 import { LOCKED_FOURTHWALL_CSS } from '../constants/lockedCss';
 import { normalizeProductUrlForMatch } from './briefGenerator';
+import { normalizeFourthwallProductUrl } from './productCatalogTaxonomy';
 
 export interface HtmlAttr {
   name: string;
@@ -2283,17 +2284,18 @@ export function updateProductCardUrls(
   dataUrlNodePaths: string[],
   newUrl: string
 ): string {
+  const canonicalUrl = normalizeFourthwallProductUrl(newUrl) || newUrl;
   const { rootChildren } = parseHtmlToAst(html);
   for (const hp of hrefNodePaths) {
     const aNode = getNodeByPath(rootChildren, hp);
     if (aNode && aNode.type === 'element') {
-      setAttr(aNode, 'href', newUrl);
+      setAttr(aNode, 'href', canonicalUrl);
     }
   }
   for (const dp of dataUrlNodePaths) {
     const imgNode = getNodeByPath(rootChildren, dp);
     if (imgNode && imgNode.type === 'element') {
-      setAttr(imgNode, 'data-product-url', newUrl);
+      setAttr(imgNode, 'data-product-url', canonicalUrl);
     }
   }
   return serializeAstToHtml(rootChildren);
@@ -2412,9 +2414,11 @@ export function applyCatalogProductToCard(
 
   // 3. Update Image src & alt (if present in card)
   if (card.fields.image) {
+    const rawDataUrl = product.productUrl || card.fields.image.dataProductUrl;
+    const canonicalDataUrl = normalizeFourthwallProductUrl(rawDataUrl) || rawDataUrl;
     const imgUpdates: Record<string, string | null> = {
       alt: product.name || card.fields.image.alt,
-      'data-product-url': product.productUrl || card.fields.image.dataProductUrl,
+      'data-product-url': canonicalDataUrl,
     };
     if (product.imageUrl?.trim()) {
       imgUpdates.src = product.imageUrl.trim();

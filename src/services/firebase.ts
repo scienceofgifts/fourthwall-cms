@@ -44,8 +44,11 @@ import {
 } from '../data/greekMythologySeed';
 import { DEFAULT_GIFT_GUIDE_CSS, ensureProjectHasSections } from './htmlWorkspaceEngine';
 import {
+  deduplicateProductTags,
   loadManagedCategories,
   migrateAndHydrateProductRecord,
+  migrateCatalogProductUrls,
+  normalizeFourthwallProductUrl,
 } from './productCatalogTaxonomy';
 
 const app = initializeApp(firebaseConfig);
@@ -354,18 +357,24 @@ export function loadLocalCatalogProducts(): Product[] | null {
   const cached = getCachedCatalogProductsSync();
   if (!cached) return null;
   const managedCats = loadManagedCategories();
-  return cached.map((p) => migrateAndHydrateProductRecord(p, managedCats));
+  return migrateCatalogProductUrls(cached, managedCats).products;
 }
 
 export async function loadLocalCatalogProductsAsync(): Promise<Product[] | null> {
   const hydrated = await hydrateCatalogProductsFromIdb();
   if (!hydrated) return null;
   const managedCats = loadManagedCategories();
-  return hydrated.map((p) => migrateAndHydrateProductRecord(p, managedCats));
+  const migrated = migrateCatalogProductUrls(hydrated, managedCats);
+  if (migrated.migratedCount > 0 || migrated.deduplicatedCount > 0) {
+    void saveCatalogProductsToIdb(migrated.products).catch(() => {});
+  }
+  return migrated.products;
 }
 
 export function saveLocalCatalogProducts(products: Product[]): void {
-  void saveCatalogProductsToIdb(products).catch(() => {
+  const managedCats = loadManagedCategories();
+  const migrated = migrateCatalogProductUrls(products, managedCats).products;
+  void saveCatalogProductsToIdb(migrated).catch(() => {
     // Best-effort background catalog cache persistence
   });
 }
@@ -377,10 +386,7 @@ function sanitizeProductPayload(
   userId: string,
   prod: Omit<Product, 'ownerId' | 'createdAt' | 'updatedAt'>
 ) {
-  const cleanTags = (prod.tags || [])
-    .map((t) => String(t).trim().slice(0, 60))
-    .filter(Boolean)
-    .slice(0, 20);
+  const cleanTags = deduplicateProductTags(prod.tags);
 
   const rawUserNotes = (prod.sourceNotes || '').split(META_DELIMITER)[0].trim();
   const packedSourceNotes = packSourceNotesWithMeta(rawUserNotes, prod);
@@ -389,10 +395,13 @@ function sanitizeProductPayload(
     ? prod.price.trim().slice(0, 50)
     : 'Unavailable';
 
+  const normalizedProductUrl =
+    normalizeFourthwallProductUrl((prod.productUrl || '').trim()) || '/products/untitled';
+
   return {
     ownerId: userId,
     name: (prod.name || 'Untitled Product').trim().slice(0, 300),
-    productUrl: (prod.productUrl || '/products/untitled').trim().slice(0, 1000),
+    productUrl: normalizedProductUrl.slice(0, 1000),
     imageUrl: (prod.imageUrl || '').trim().slice(0, 2000),
     price: firestorePrice,
     currency: (prod.currency || 'USD').trim().slice(0, 10),
@@ -464,9 +473,10 @@ export function subscribeToProducts(
   return onSnapshot(
     q,
     (snap) => {
-      const items: Product[] = snap.docs.map((d) =>
+      const rawItems: Product[] = snap.docs.map((d) =>
         unpackProductFromFirestoreDoc(d.data() as Omit<Product, 'id'>, d.id)
       );
+      const items = migrateCatalogProductUrls(rawItems, loadManagedCategories()).products;
       items.sort((a, b) => a.name.localeCompare(b.name));
       saveLocalCatalogProducts(items);
       onData(items);

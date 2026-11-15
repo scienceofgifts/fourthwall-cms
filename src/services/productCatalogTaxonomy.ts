@@ -225,12 +225,55 @@ export function renameManagedCategory(
     return prod;
   });
 
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      const rememberedRaw = window.localStorage.getItem('sog_catalog_last_selected_category_v1');
+      if (rememberedRaw && toTaxonomyKey(rememberedRaw) === oldKey) {
+        window.localStorage.setItem('sog_catalog_last_selected_category_v1', existingNewMatch);
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
   return {
     categories: savedCategories,
     canonicalNewName: existingNewMatch,
     updatedProducts,
     changedProducts,
   };
+}
+
+/**
+ * Removes a category from the managed category list while preserving any existing products that use it.
+ * If the removed category was the remembered last-selected category, clears that remembered preference
+ * so subsequent imports fall back safely to the normal category selector.
+ */
+export function deleteManagedCategory(
+  categoryToRemove: string,
+  currentCategories?: readonly string[]
+): { categories: string[]; removed: boolean } {
+  const cats = currentCategories ? [...currentCategories] : loadManagedCategories();
+  const targetKey = toTaxonomyKey(categoryToRemove);
+  if (!targetKey) {
+    return { categories: cats, removed: false };
+  }
+  const filtered = cats.filter((c) => toTaxonomyKey(c) !== targetKey);
+  const removed = filtered.length !== cats.length;
+  const saved = saveManagedCategories(filtered);
+
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      const rememberedRaw = window.localStorage.getItem('sog_catalog_last_selected_category_v1');
+      if (rememberedRaw && toTaxonomyKey(rememberedRaw) === targetKey) {
+        window.localStorage.removeItem('sog_catalog_last_selected_category_v1');
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  return { categories: saved, removed };
 }
 
 /**
@@ -658,15 +701,23 @@ export function detectProductType(input: ProductTypeDetectionInput): ProductType
 }
 
 /**
- * Resolves the appropriate productType and category for an existing/migrated product record:
+ * Resolves the appropriate productType, category, and normalized Fourthwall URL for an existing/migrated product record:
+ * - Normalizes Fourthwall `/en-usd/products/...` URLs to `/products/...` while preserving product identity.
  * - Preserves existing category strings (normalizing case/whitespace if matching a managed category).
  * - Preserves manually confirmed or non-empty product types.
  * - Populates a suggested productType via local detection only when the existing product lacks one.
+ * - Deduplicates tags cleanly while preserving display casing.
  */
 export function migrateAndHydrateProductRecord(
   product: Product,
   managedCategories: readonly string[] = INITIAL_PRODUCT_CATEGORIES
 ): Product {
+  const normalizedUrl =
+    normalizeFourthwallProductUrl(product.productUrl || '') || product.productUrl;
+  const cleanTags = Array.isArray(product.tags)
+    ? deduplicateProductTags(product.tags)
+    : product.tags;
+
   const rawCategory = normalizeTaxonomyLabel(product.category || '');
   const canonicalCategory = rawCategory
     ? findCanonicalOption(rawCategory, managedCategories) || rawCategory
@@ -677,22 +728,592 @@ export function migrateAndHydrateProductRecord(
     const canonicalManagedType = findCanonicalOption(rawType, MANAGED_PRODUCT_TYPES);
     return {
       ...product,
+      productUrl: normalizedUrl,
       category: canonicalCategory,
       productType: canonicalManagedType || rawType,
+      ...(cleanTags ? { tags: cleanTags } : {}),
     };
   }
 
   const detection = detectProductType({
     name: product.name,
-    productUrl: product.productUrl,
+    productUrl: normalizedUrl,
     shortDescription: product.shortDescription,
     featuresSpecs: product.featuresSpecs,
-    tags: product.tags,
+    tags: cleanTags,
   });
 
   return {
     ...product,
+    productUrl: normalizedUrl,
     category: canonicalCategory,
     productType: detection.isConfident ? detection.detectedType : 'Other',
+    ...(cleanTags ? { tags: cleanTags } : {}),
   };
 }
+
+// ============================================================================
+// FOURTHWALL URL NORMALIZATION (REMOVING `/en-usd` LOCALE PREFIX)
+// ============================================================================
+
+const IMAGE_OR_ASSET_EXTENSION_RE =
+  /\.(?:webp|jpg|jpeg|png|gif|svg|avif|ico|css|js|json|xml|pdf|woff2?|ttf)$/i;
+const FOURTHWALL_STOREFRONT_ROUTE_AFTER_LOCALE_RE =
+  /^\/en-usd(\/(?:products|collections|pages|cart|checkouts)(?:\/|$).*)$/i;
+
+function isAssetOrCdnHostname(hostname: string): boolean {
+  const lower = (hostname || '').toLowerCase();
+  return (
+    lower.startsWith('cdn.') ||
+    lower.startsWith('images.') ||
+    lower.startsWith('img.') ||
+    lower.startsWith('assets.') ||
+    lower.startsWith('static.') ||
+    lower.includes('.r2.dev') ||
+    lower.includes('.r2.cloudflarestorage.com') ||
+    lower.includes('storage.googleapis.com')
+  );
+}
+
+function isKnownStorefrontHostname(hostname: string): boolean {
+  const lower = (hostname || '').toLowerCase();
+  return (
+    lower === 'scienceofgifts.com' ||
+    lower.endsWith('.scienceofgifts.com') ||
+    lower === 'fourthwall.com' ||
+    lower.endsWith('.fourthwall.com') ||
+    lower.endsWith('.fourthwall.shop')
+  );
+}
+
+function stripTrailingPathnameSlash(pathname: string): string {
+  if (!pathname || pathname === '/') return pathname || '/';
+  return pathname.replace(/\/+$/, '') || '/';
+}
+
+function normalizeStorefrontPathname(
+  pathname: string,
+  isKnownStoreHost: boolean
+): {
+  normalizedPathname: string;
+  changed: boolean;
+} {
+  if (!pathname || IMAGE_OR_ASSET_EXTENSION_RE.test(pathname)) {
+    return { normalizedPathname: pathname, changed: false };
+  }
+
+  const routeMatch = pathname.match(FOURTHWALL_STOREFRONT_ROUTE_AFTER_LOCALE_RE);
+  if (routeMatch && routeMatch[1]) {
+    const stripped = stripTrailingPathnameSlash(routeMatch[1]);
+    return { normalizedPathname: stripped, changed: true };
+  }
+
+  if (isKnownStoreHost && /^\/en-usd\/?$/i.test(pathname)) {
+    return { normalizedPathname: '/', changed: true };
+  }
+
+  if (
+    /^\/products\/[^/]+\/+$/i.test(pathname) ||
+    /^\/collections\/[^/]+\/products\/[^/]+\/+$/i.test(pathname)
+  ) {
+    const stripped = stripTrailingPathnameSlash(pathname);
+    return { normalizedPathname: stripped, changed: stripped !== pathname };
+  }
+
+  return { normalizedPathname: pathname, changed: false };
+}
+
+/**
+ * Checks whether a URL string contains a localized Fourthwall `/en-usd` storefront prefix
+ * that `normalizeFourthwallProductUrl` will strip.
+ */
+export function isLocalizedFourthwallProductUrl(rawUrl: string): boolean {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return false;
+  return normalizeFourthwallProductUrl(trimmed) !== trimmed;
+}
+
+/**
+ * Deterministically normalizes Fourthwall storefront & product URLs by removing the `/en-usd`
+ * locale prefix when it appears as a storefront route prefix:
+ *   - `https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt`
+ *     -> `https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt`
+ *   - `/en-usd/products/funny-youtuber-definition-t-shirt`
+ *     -> `/products/funny-youtuber-definition-t-shirt`
+ *
+ * Rules:
+ *   - Removes `/en-usd` ONLY when it is a locale prefix before Fourthwall storefront routes
+ *     (`/products/...`, `/collections/...`, `/pages/...`, `/cart`, `/checkouts`, or root on storefront host).
+ *   - Never alters product slugs that contain `en-usd` inside the handle (e.g. `/products/en-usd-shirt`).
+ *   - Never alters image CDN URLs or static asset URLs.
+ *   - Preserves query parameters (`?variant=...`) and hash fragments (`#...`) while cleaning trailing slashes.
+ */
+export function normalizeFourthwallProductUrl(rawUrl: string): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return '';
+
+  // 1. Relative path starting with `/` (or `en-usd/...` without a leading slash)
+  if (
+    /^en-usd\/(?:products|collections|pages|cart|checkouts)(?:\/|$)/i.test(trimmed)
+  ) {
+    return normalizeFourthwallProductUrl(`/${trimmed}`);
+  }
+
+  if (trimmed.startsWith('/') && !trimmed.startsWith('//')) {
+    const hashIdx = trimmed.indexOf('#');
+    const fragment = hashIdx >= 0 ? trimmed.slice(hashIdx) : '';
+    const beforeHash = hashIdx >= 0 ? trimmed.slice(0, hashIdx) : trimmed;
+
+    const queryIdx = beforeHash.indexOf('?');
+    const search = queryIdx >= 0 ? beforeHash.slice(queryIdx) : '';
+    const pathname = queryIdx >= 0 ? beforeHash.slice(0, queryIdx) : beforeHash;
+
+    const { normalizedPathname, changed } = normalizeStorefrontPathname(pathname, true);
+    if (!changed) return trimmed;
+    return `${normalizedPathname}${search}${fragment}`;
+  }
+
+  // 2. Full http:// or https:// URL
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed);
+      if (isAssetOrCdnHostname(parsed.hostname)) {
+        return trimmed;
+      }
+      const knownHost = isKnownStorefrontHostname(parsed.hostname);
+      const { normalizedPathname, changed } = normalizeStorefrontPathname(
+        parsed.pathname,
+        knownHost
+      );
+      if (!changed) {
+        return trimmed;
+      }
+      parsed.pathname = normalizedPathname;
+      return parsed.toString();
+    } catch {
+      return trimmed;
+    }
+  }
+
+  // 3. Bare domain pasted without scheme (e.g. `shop.scienceofgifts.com/en-usd/products/foo`)
+  if (/^[a-z0-9.-]+\.[a-z]{2,}\/en-usd\/(?:products|collections|pages)\b/i.test(trimmed)) {
+    const slashIdx = trimmed.indexOf('/');
+    const hostPart = trimmed.slice(0, slashIdx);
+    if (!isAssetOrCdnHostname(hostPart)) {
+      const rest = trimmed.slice(slashIdx);
+      const normalizedRest = normalizeFourthwallProductUrl(rest);
+      return `${hostPart}${normalizedRest}`;
+    }
+  }
+
+  return trimmed;
+}
+
+function getNormalizedProductUrlComparisonKey(url: string): string {
+  const norm = normalizeFourthwallProductUrl(url).trim();
+  if (!norm) return '';
+  const withoutQuery = norm.split('?')[0].split('#')[0].replace(/\/+$/, '').toLowerCase();
+  const prodIdx = withoutQuery.indexOf('/products/');
+  if (prodIdx >= 0) {
+    return withoutQuery.slice(prodIdx);
+  }
+  return withoutQuery;
+}
+
+/**
+ * Batch-migrates a catalog product list so any `/en-usd/products/...` links are normalized
+ * to canonical `/products/...` URLs while preserving product identity, all product fields,
+ * and deduplicating any collision where both localized and canonical records existed.
+ */
+export function migrateCatalogProductUrls(
+  products: readonly Product[],
+  managedCategories?: readonly string[]
+): {
+  products: Product[];
+  migratedCount: number;
+  deduplicatedCount: number;
+} {
+  const cats = managedCategories || loadManagedCategories();
+  let migratedCount = 0;
+  let deduplicatedCount = 0;
+
+  const byUrlKey = new Map<string, number>();
+  const result: Product[] = [];
+
+  for (const rawProd of products) {
+    const wasLocalized = isLocalizedFourthwallProductUrl(rawProd.productUrl);
+    const hydrated = migrateAndHydrateProductRecord(rawProd, cats);
+    if (wasLocalized || hydrated.productUrl !== rawProd.productUrl) {
+      migratedCount++;
+    }
+
+    const urlKey = getNormalizedProductUrlComparisonKey(hydrated.productUrl);
+    if (!urlKey) {
+      result.push(hydrated);
+      continue;
+    }
+
+    const existingIdx = byUrlKey.get(urlKey);
+    if (existingIdx === undefined) {
+      byUrlKey.set(urlKey, result.length);
+      result.push(hydrated);
+    } else {
+      deduplicatedCount++;
+      const existing = result[existingIdx];
+      const primary = !wasLocalized ? hydrated : existing;
+      const secondary = !wasLocalized ? existing : hydrated;
+
+      result[existingIdx] = {
+        ...secondary,
+        ...primary,
+        id: existing.id || hydrated.id,
+        productUrl: primary.productUrl || secondary.productUrl,
+        name: primary.name || secondary.name,
+        price:
+          primary.price && primary.price !== 'Unavailable'
+            ? primary.price
+            : secondary.price || primary.price,
+        originalPrice: primary.originalPrice || secondary.originalPrice,
+        imageUrl: primary.imageUrl || secondary.imageUrl,
+        imageUrls:
+          primary.imageUrls && primary.imageUrls.length > 0
+            ? primary.imageUrls
+            : secondary.imageUrls,
+        shortDescription: primary.shortDescription || secondary.shortDescription,
+        featuresSpecs: primary.featuresSpecs || secondary.featuresSpecs,
+        sourceNotes: primary.sourceNotes || secondary.sourceNotes,
+        sku: primary.sku || secondary.sku,
+        variants:
+          primary.variants && primary.variants.length > 0
+            ? primary.variants
+            : secondary.variants,
+        tags: deduplicateProductTags([
+          ...(primary.tags || []),
+          ...(secondary.tags || []),
+        ]),
+      };
+    }
+  }
+
+  return {
+    products: result,
+    migratedCount,
+    deduplicatedCount,
+  };
+}
+
+// ============================================================================
+// REMEMBERED CATEGORY & TAG REUSE PERSISTENCE
+// ============================================================================
+
+export const LOCAL_LAST_SELECTED_CATEGORY_KEY = 'sog_catalog_last_selected_category_v1';
+export const LOCAL_LAST_SAVED_TAGS_KEY = 'sog_catalog_last_saved_tags_v1';
+export const LOCAL_REUSE_LAST_TAGS_ENABLED_KEY = 'sog_catalog_reuse_last_tags_enabled_v1';
+
+/**
+ * Loads the last manually selected and saved product category from localStorage.
+ * Validates that the remembered category still exists in `managedCategories`.
+ * If no remembered category exists or it was deleted from `managedCategories`, returns `null`.
+ */
+export function loadRememberedProductCategory(
+  managedCategories?: readonly string[]
+): string | null {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return null;
+  }
+  try {
+    const raw = window.localStorage.getItem(LOCAL_LAST_SELECTED_CATEGORY_KEY);
+    const clean = normalizeTaxonomyLabel(raw || '');
+    if (!clean) return null;
+    const cats = managedCategories ?? loadManagedCategories();
+    const canonical = findCanonicalOption(clean, cats);
+    return canonical || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Saves the selected product category as the remembered default for subsequent product imports.
+ */
+export function saveRememberedProductCategory(
+  category: string,
+  managedCategories?: readonly string[]
+): string | null {
+  const clean = normalizeTaxonomyLabel(category);
+  if (!clean) {
+    clearRememberedProductCategory();
+    return null;
+  }
+  const cats = managedCategories ?? loadManagedCategories();
+  const canonical = findCanonicalOption(clean, cats) || clean;
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      window.localStorage.setItem(LOCAL_LAST_SELECTED_CATEGORY_KEY, canonical);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+  return canonical;
+}
+
+export function clearRememberedProductCategory(): void {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      window.localStorage.removeItem(LOCAL_LAST_SELECTED_CATEGORY_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+}
+
+/**
+ * Resolves the initial category for the Review & Save / Edit Product modal:
+ * - When editing an existing product (`isExistingEdit: true`), strictly preserves the existing product's category.
+ * - When importing/creating a new product (`isExistingEdit: false`), preselects the remembered category if valid;
+ *   otherwise falls back to the auto-detected extracted category or `'General History'`.
+ */
+export function resolveCategoryForProductModal(params: {
+  isExistingEdit: boolean;
+  existingCategory?: string;
+  extractedCategory?: string;
+  managedCategories?: readonly string[];
+}): {
+  category: string;
+  source: 'existing_product' | 'remembered_category' | 'auto_detected' | 'default_fallback';
+} {
+  const cats = params.managedCategories ?? loadManagedCategories();
+
+  if (params.isExistingEdit) {
+    const cleanExisting = normalizeTaxonomyLabel(params.existingCategory || '');
+    if (cleanExisting && toTaxonomyKey(cleanExisting) !== 'general') {
+      const canonical = findCanonicalOption(cleanExisting, cats) || cleanExisting;
+      return { category: canonical, source: 'existing_product' };
+    }
+    const cleanExtracted = normalizeTaxonomyLabel(params.extractedCategory || '');
+    if (cleanExtracted && toTaxonomyKey(cleanExtracted) !== 'general') {
+      const canonical = findCanonicalOption(cleanExtracted, cats) || cleanExtracted;
+      return { category: canonical, source: 'auto_detected' };
+    }
+    return { category: 'General History', source: 'existing_product' };
+  }
+
+  // New product import: check remembered category first
+  const remembered = loadRememberedProductCategory(cats);
+  if (remembered) {
+    return { category: remembered, source: 'remembered_category' };
+  }
+
+  // Fallback to auto-detected category if no valid remembered category exists
+  const cleanExtracted = normalizeTaxonomyLabel(params.extractedCategory || '');
+  if (cleanExtracted && toTaxonomyKey(cleanExtracted) !== 'general') {
+    const canonical = findCanonicalOption(cleanExtracted, cats) || cleanExtracted;
+    return { category: canonical, source: 'auto_detected' };
+  }
+
+  return { category: 'General History', source: 'default_fallback' };
+}
+
+/**
+ * Deduplicates and normalizes a list or comma-separated string of product tags.
+ * Preserves consistent formatting and first-seen casing while deduplicating case-insensitively.
+ */
+export function deduplicateProductTags(
+  input: readonly string[] | string | undefined | null
+): string[] {
+  if (!input) return [];
+  const rawTokens = Array.isArray(input) ? input : String(input).split(',');
+
+  const seenLower = new Set<string>();
+  const result: string[] = [];
+
+  for (const token of rawTokens) {
+    const cleaned = String(token ?? '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .slice(0, 60);
+    if (!cleaned) continue;
+    const lower = cleaned.toLowerCase();
+    if (!seenLower.has(lower)) {
+      seenLower.add(lower);
+      result.push(cleaned);
+      if (result.length >= 20) break;
+    }
+  }
+  return result;
+}
+
+export function formatProductTagsInput(
+  input: readonly string[] | string | undefined | null
+): string {
+  return deduplicateProductTags(input).join(', ');
+}
+
+/**
+ * Loads the last saved product tags from localStorage.
+ */
+export function loadRememberedProductTags(): string[] {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return [];
+  }
+  try {
+    const raw = window.localStorage.getItem(LOCAL_LAST_SAVED_TAGS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return deduplicateProductTags(parsed.filter((x) => typeof x === 'string'));
+    }
+    if (typeof parsed === 'string') {
+      return deduplicateProductTags(parsed);
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Saves the current product's deduplicated tags to localStorage for reuse on subsequent imports.
+ */
+export function saveRememberedProductTags(
+  tags: readonly string[] | string | undefined | null
+): string[] {
+  const clean = deduplicateProductTags(tags);
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      window.localStorage.setItem(LOCAL_LAST_SAVED_TAGS_KEY, JSON.stringify(clean));
+    } catch {
+      // Ignore storage errors
+    }
+  }
+  return clean;
+}
+
+export function clearRememberedProductTags(): void {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      window.localStorage.removeItem(LOCAL_LAST_SAVED_TAGS_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+}
+
+/**
+ * Loads the user's "Reuse last tags" toggle preference from localStorage (defaults to `true`).
+ */
+export function loadReuseLastTagsPreference(): boolean {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return true;
+  }
+  try {
+    const raw = window.localStorage.getItem(LOCAL_REUSE_LAST_TAGS_ENABLED_KEY);
+    if (raw === null) return true;
+    return raw !== 'false' && raw !== '0';
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Saves the user's "Reuse last tags" toggle preference to localStorage.
+ */
+export function saveReuseLastTagsPreference(enabled: boolean): boolean {
+  const boolVal = Boolean(enabled);
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      window.localStorage.setItem(
+        LOCAL_REUSE_LAST_TAGS_ENABLED_KEY,
+        boolVal ? 'true' : 'false'
+      );
+    } catch {
+      // Ignore storage errors
+    }
+  }
+  return boolVal;
+}
+
+/**
+ * Resolves the initial tags for the Review & Save / Edit Product modal:
+ * - Editing an existing product (`isExistingEdit: true`): strictly preserves existing product tags without overwriting.
+ * - New product import (`isExistingEdit: false`):
+ *   - If extracted tags exist on the newly fetched product, keeps `extractedTags` as the initial tags
+ *     (never silently mixing unrelated remembered tags into extracted tags) and flags `hasExtractedVsRememberedChoice: true`
+ *     so the UI can offer one-click "Use Last Tags" or "Merge Last Tags" with full reversibility.
+ *   - If no extracted tags exist and `reuseLastTags` is enabled, pre-fills `rememberedTags`.
+ *   - If `reuseLastTags` is disabled, leaves tags empty (or extracted only).
+ */
+export function resolveTagsForProductModal(params: {
+  isExistingEdit: boolean;
+  existingTags?: readonly string[];
+  extractedTags?: readonly string[];
+  rememberedTags?: readonly string[];
+  reuseLastTagsEnabled?: boolean;
+}): {
+  tags: string[];
+  tagsInput: string;
+  extractedTags: string[];
+  rememberedTags: string[];
+  reuseLastTagsEnabled: boolean;
+  source: 'existing_product' | 'remembered_tags' | 'extracted_tags' | 'empty';
+  hasExtractedVsRememberedChoice: boolean;
+} {
+  const cleanExisting = deduplicateProductTags(params.existingTags);
+  const cleanExtracted = deduplicateProductTags(params.extractedTags);
+  const cleanRemembered = deduplicateProductTags(
+    params.rememberedTags ?? loadRememberedProductTags()
+  );
+  const reuseEnabled =
+    params.reuseLastTagsEnabled ?? loadReuseLastTagsPreference();
+
+  if (params.isExistingEdit) {
+    return {
+      tags: cleanExisting,
+      tagsInput: cleanExisting.join(', '),
+      extractedTags: cleanExtracted,
+      rememberedTags: cleanRemembered,
+      reuseLastTagsEnabled: reuseEnabled,
+      source: 'existing_product',
+      hasExtractedVsRememberedChoice: false,
+    };
+  }
+
+  // New product import
+  if (cleanExtracted.length > 0) {
+    const extractedKey = cleanExtracted.map((t) => t.toLowerCase()).join('|');
+    const rememberedKey = cleanRemembered.map((t) => t.toLowerCase()).join('|');
+    return {
+      tags: cleanExtracted,
+      tagsInput: cleanExtracted.join(', '),
+      extractedTags: cleanExtracted,
+      rememberedTags: cleanRemembered,
+      reuseLastTagsEnabled: reuseEnabled,
+      source: 'extracted_tags',
+      hasExtractedVsRememberedChoice:
+        cleanRemembered.length > 0 && extractedKey !== rememberedKey,
+    };
+  }
+
+  if (reuseEnabled && cleanRemembered.length > 0) {
+    return {
+      tags: cleanRemembered,
+      tagsInput: cleanRemembered.join(', '),
+      extractedTags: [],
+      rememberedTags: cleanRemembered,
+      reuseLastTagsEnabled: reuseEnabled,
+      source: 'remembered_tags',
+      hasExtractedVsRememberedChoice: false,
+    };
+  }
+
+  return {
+    tags: [],
+    tagsInput: '',
+    extractedTags: [],
+    rememberedTags: cleanRemembered,
+    reuseLastTagsEnabled: reuseEnabled,
+    source: 'empty',
+    hasExtractedVsRememberedChoice: false,
+  };
+}
+

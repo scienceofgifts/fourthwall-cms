@@ -100,11 +100,27 @@ import {
   INITIAL_PRODUCT_CATEGORIES,
   MANAGED_PRODUCT_TYPES,
   addManagedCategory,
+  clearRememberedProductCategory,
+  clearRememberedProductTags,
+  deduplicateProductTags,
+  deleteManagedCategory,
   detectProductType,
+  formatProductTagsInput,
   getUncatalogedProductCategories,
+  isLocalizedFourthwallProductUrl,
   loadManagedCategories,
+  loadRememberedProductCategory,
+  loadRememberedProductTags,
+  loadReuseLastTagsPreference,
   migrateAndHydrateProductRecord,
+  migrateCatalogProductUrls,
+  normalizeFourthwallProductUrl,
   renameManagedCategory,
+  resolveCategoryForProductModal,
+  resolveTagsForProductModal,
+  saveRememberedProductCategory,
+  saveRememberedProductTags,
+  saveReuseLastTagsPreference,
 } from './services/productCatalogTaxonomy';
 import {
   countWords,
@@ -131,6 +147,7 @@ import {
   handleImageOptimizeRequest,
   handleImageOptimizerStatusRequest,
   handleImageUploadR2Request,
+  handleProductFetchUrlRequest,
   handleProductParseHtmlRequest,
 } from './services/serverApiHandlers';
 import {
@@ -4324,6 +4341,558 @@ describe('Feature 12: Editable, Replaceable, and Persistent Fourthwall Header CS
     expect((await loadFourthwallHeaderCssAsync()).currentCss).toBe(customGlobalHeaderCss);
   });
 });
+
+describe('Product Catalog Import Workflow: Remembered Categories, Remembered Tags & Fourthwall /en-usd URL Normalization (All 12 Scenarios)', () => {
+  const setupMockStorage = () => {
+    const store = new Map<string, string>();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => store.set(k, v),
+          removeItem: (k: string) => store.delete(k),
+          clear: () => store.clear(),
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+    return store;
+  };
+
+  it('1, 2, 3, 4 & 5. remembers the last selected category, preselects it on subsequent imports, updates when changed, falls back safely if missing/deleted, and preserves existing product categories on edit', () => {
+    setupMockStorage();
+
+    // 4a. When no remembered category exists yet, falls back to detected category or General History
+    expect(loadRememberedProductCategory()).toBeNull();
+    expect(
+      resolveCategoryForProductModal({
+        isExistingEdit: false,
+        managedCategories: loadManagedCategories(),
+      })
+    ).toEqual({
+      category: 'General History',
+      source: 'default_fallback',
+    });
+
+    // 1. Save a product with "Ancient Rome" and remember the category
+    const savedCat = saveRememberedProductCategory('Ancient Rome');
+    expect(savedCat).toBe('Ancient Rome');
+    expect(loadRememberedProductCategory()).toBe('Ancient Rome');
+
+    // 2. Next imported product automatically preselects "Ancient Rome"
+    expect(
+      resolveCategoryForProductModal({
+        isExistingEdit: false,
+        extractedCategory: '',
+        managedCategories: loadManagedCategories(),
+      })
+    ).toEqual({
+      category: 'Ancient Rome',
+      source: 'remembered_category',
+    });
+
+    // 3. Change the category to a custom category ("Byzantine Empire") and save -> updates remembered category
+    addManagedCategory('Byzantine Empire');
+    saveRememberedProductCategory('Byzantine Empire');
+    expect(loadRememberedProductCategory()).toBe('Byzantine Empire');
+    expect(
+      resolveCategoryForProductModal({
+        isExistingEdit: false,
+        managedCategories: loadManagedCategories(),
+      })
+    ).toEqual({
+      category: 'Byzantine Empire',
+      source: 'remembered_category',
+    });
+
+    // Renaming a managed category also updates the remembered category automatically
+    renameManagedCategory('Byzantine Empire', 'Eastern Roman Empire', []);
+    expect(loadRememberedProductCategory()).toBe('Eastern Roman Empire');
+    expect(
+      resolveCategoryForProductModal({
+        isExistingEdit: false,
+        managedCategories: loadManagedCategories(),
+      })
+    ).toEqual({
+      category: 'Eastern Roman Empire',
+      source: 'remembered_category',
+    });
+
+    // 4b. Deleting the remembered category clears or safely falls back to General History / detected category
+    deleteManagedCategory('Eastern Roman Empire');
+    expect(loadRememberedProductCategory()).toBeNull();
+    expect(
+      resolveCategoryForProductModal({
+        isExistingEdit: false,
+        extractedCategory: 'Greek Mythology',
+        managedCategories: loadManagedCategories(),
+      })
+    ).toEqual({
+      category: 'Greek Mythology',
+      source: 'auto_detected',
+    });
+
+    // Even if localStorage manually contains a stale deleted category name, resolveCategoryForProductModal falls back safely
+    saveRememberedProductCategory('Deleted Niche Category');
+    expect(
+      resolveCategoryForProductModal({
+        isExistingEdit: false,
+        extractedCategory: '',
+        managedCategories: loadManagedCategories(),
+      })
+    ).toEqual({
+      category: 'General History',
+      source: 'default_fallback',
+    });
+
+    // 5. Editing an already-saved catalog product ALWAYS preserves that product's existing category instead of overwriting it with the remembered category
+    saveRememberedProductCategory('World War II');
+    expect(
+      resolveCategoryForProductModal({
+        isExistingEdit: true,
+        existingCategory: 'Civil War',
+        managedCategories: loadManagedCategories(),
+      })
+    ).toEqual({
+      category: 'Civil War',
+      source: 'existing_product',
+    });
+
+    clearRememberedProductCategory();
+    expect(loadRememberedProductCategory()).toBeNull();
+  });
+
+  it('6 & 7. remembers and reuses last saved tags with case-insensitive deduplication, avoids silently mixing into extracted tags, supports disabling reuse, and preserves existing product tags on edit', () => {
+    setupMockStorage();
+
+    // Default state: reuse enabled, no remembered tags yet
+    expect(loadReuseLastTagsPreference()).toBe(true);
+    expect(loadRememberedProductTags()).toEqual([]);
+
+    // 6a. Save tags with duplicate casing and extra whitespace -> deduplicated cleanly while preserving display casing
+    const savedTags = saveRememberedProductTags([
+      '  Roman Empire ',
+      'SPQR',
+      'roman empire',
+      'Stoicism',
+      'spqr',
+      '',
+    ]);
+    expect(savedTags).toEqual(['Roman Empire', 'SPQR', 'Stoicism']);
+    expect(loadRememberedProductTags()).toEqual(['Roman Empire', 'SPQR', 'Stoicism']);
+    expect(
+      deduplicateProductTags(['Marcus Aurelius', 'spqr', 'SPQR', 'Stoicism'])
+    ).toEqual(['Marcus Aurelius', 'spqr', 'Stoicism']);
+    expect(formatProductTagsInput('Marcus Aurelius, spqr, SPQR, Stoicism')).toBe(
+      'Marcus Aurelius, spqr, Stoicism'
+    );
+
+    // 6b. Next newly imported product with NO extracted tags automatically pre-fills the remembered tags
+    const resolvedNoExtracted = resolveTagsForProductModal({
+      isExistingEdit: false,
+      extractedTags: [],
+    });
+    expect(resolvedNoExtracted.tags).toEqual(['Roman Empire', 'SPQR', 'Stoicism']);
+    expect(resolvedNoExtracted.source).toBe('remembered_tags');
+
+    // 6c. Next newly imported product that ALREADY has extracted tags from the storefront page does NOT silently mix unrelated remembered tags into extracted tags
+    const resolvedWithExtracted = resolveTagsForProductModal({
+      isExistingEdit: false,
+      extractedTags: ['youtuber', 'funny definition', 'Youtuber'],
+    });
+    expect(resolvedWithExtracted.tags).toEqual(['youtuber', 'funny definition']);
+    expect(resolvedWithExtracted.source).toBe('extracted_tags');
+    expect(resolvedWithExtracted.hasExtractedVsRememberedChoice).toBe(true);
+
+    // 6d. Disabling "Reuse last tags" stops pre-filling remembered tags when switching product niches
+    saveReuseLastTagsPreference(false);
+    expect(loadReuseLastTagsPreference()).toBe(false);
+    const resolvedWhenDisabled = resolveTagsForProductModal({
+      isExistingEdit: false,
+      extractedTags: [],
+    });
+    expect(resolvedWhenDisabled.tags).toEqual([]);
+    expect(resolvedWhenDisabled.source).toBe('empty');
+
+    // Re-enable reuse
+    saveReuseLastTagsPreference(true);
+
+    // 7. Editing an existing saved catalog product ALWAYS preserves its existing tags (even if empty or different from remembered tags)
+    const resolvedExistingWithTags = resolveTagsForProductModal({
+      isExistingEdit: true,
+      existingTags: ['Greek Mythology', 'Athena Owl'],
+    });
+    expect(resolvedExistingWithTags.tags).toEqual(['Greek Mythology', 'Athena Owl']);
+    expect(resolvedExistingWithTags.source).toBe('existing_product');
+
+    const resolvedExistingEmpty = resolveTagsForProductModal({
+      isExistingEdit: true,
+      existingTags: [],
+    });
+    expect(resolvedExistingEmpty.tags).toEqual([]);
+    expect(resolvedExistingEmpty.source).toBe('existing_product');
+
+    clearRememberedProductTags();
+    expect(loadRememberedProductTags()).toEqual([]);
+  });
+
+  it('8, 9 & 10. normalizes full and relative Fourthwall /en-usd/products/... URLs while preserving canonical URLs, query params, fragments, slugs containing en-usd, and image CDN URLs', () => {
+    // 8. Full Fourthwall URLs with /en-usd/
+    expect(
+      normalizeFourthwallProductUrl(
+        'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt'
+      )
+    ).toBe('https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt');
+
+    expect(
+      normalizeFourthwallProductUrl(
+        'https://scienceofgifts.com/en-USD/products/spqr-roman-standard-hoodie/'
+      )
+    ).toBe('https://scienceofgifts.com/products/spqr-roman-standard-hoodie');
+
+    // 9. Relative Fourthwall paths with /en-usd/
+    expect(
+      normalizeFourthwallProductUrl('/en-usd/products/funny-youtuber-definition-t-shirt')
+    ).toBe('/products/funny-youtuber-definition-t-shirt');
+
+    expect(
+      normalizeFourthwallProductUrl('en-usd/products/funny-youtuber-definition-t-shirt')
+    ).toBe('/products/funny-youtuber-definition-t-shirt');
+
+    // 10a. Already-normalized Fourthwall URLs remain unchanged
+    expect(
+      normalizeFourthwallProductUrl(
+        'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt'
+      )
+    ).toBe('https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt');
+    expect(
+      normalizeFourthwallProductUrl('/products/funny-youtuber-definition-t-shirt')
+    ).toBe('/products/funny-youtuber-definition-t-shirt');
+
+    // 10b. Preserves query parameters and hash fragments
+    expect(
+      normalizeFourthwallProductUrl(
+        'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt?variant=49102#sizing'
+      )
+    ).toBe(
+      'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt?variant=49102#sizing'
+    );
+    expect(
+      normalizeFourthwallProductUrl(
+        '/en-usd/products/funny-youtuber-definition-t-shirt?utm_source=guide#reviews'
+      )
+    ).toBe('/products/funny-youtuber-definition-t-shirt?utm_source=guide#reviews');
+
+    // 10c. Does NOT corrupt product slugs that contain "en-usd" inside the product handle
+    expect(
+      normalizeFourthwallProductUrl('https://shop.scienceofgifts.com/products/en-usd-currency-shirt')
+    ).toBe('https://shop.scienceofgifts.com/products/en-usd-currency-shirt');
+    expect(
+      normalizeFourthwallProductUrl(
+        'https://shop.scienceofgifts.com/en-usd/products/en-usd-currency-shirt'
+      )
+    ).toBe('https://shop.scienceofgifts.com/products/en-usd-currency-shirt');
+
+    // 10d. Does NOT modify image CDN URLs or non-product external URLs
+    const r2ImageUrl =
+      'https://images.scienceofgifts.com/gift-guides/youtuber-gifts/funny-youtuber-definition-t-shirt.webp';
+    const fwCdnUrl = 'https://cdn.fourthwall.com/offer/en-usd/image-123.jpg';
+    expect(normalizeFourthwallProductUrl(r2ImageUrl)).toBe(r2ImageUrl);
+    expect(normalizeFourthwallProductUrl(fwCdnUrl)).toBe(fwCdnUrl);
+
+    expect(
+      isLocalizedFourthwallProductUrl(
+        'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt'
+      )
+    ).toBe(true);
+    expect(
+      isLocalizedFourthwallProductUrl(
+        'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt'
+      )
+    ).toBe(false);
+  });
+
+  it('11. migrates existing catalog products with /en-usd/ URLs without losing data or creating duplicates, and retries localized URLs during server product fetch when needed', async () => {
+    setupMockStorage();
+
+    // 11a. Single record migration preserves ID and all fields while stripping /en-usd
+    const legacyProduct = migrateAndHydrateProductRecord({
+      id: 'prod-youtuber-tee',
+      ownerId: 'local-preview',
+      name: 'Funny YouTuber Definition T-Shirt',
+      productUrl:
+        'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt',
+      imageUrl: 'https://cdn.fourthwall.com/youtuber-tee.jpg',
+      price: '$24.99',
+      currency: 'USD',
+      category: 'General History',
+      productType: 'T-Shirt',
+      tags: ['YouTuber', 'youtuber', 'Creator Gift'],
+      shortDescription: '<p>Creator definition tee</p>',
+      featuresSpecs: '100% Cotton',
+      sourceNotes: '<p>Soft ringspun cotton.</p>',
+      archived: false,
+    });
+
+    expect(legacyProduct.id).toBe('prod-youtuber-tee');
+    expect(legacyProduct.productUrl).toBe(
+      'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt'
+    );
+    expect(legacyProduct.tags).toEqual(['YouTuber', 'Creator Gift']);
+    expect(legacyProduct.shortDescription).toBe('<p>Creator definition tee</p>');
+
+    // 11b. Catalog-wide migration deduplicates collisions if both /en-usd/products/x and /products/x existed, merging fields without losing data
+    const migratedCatalog = migrateCatalogProductUrls([
+      {
+        ...SEED_PRODUCTS[0],
+        id: 'prod-dup-localized',
+        ownerId: 'local-preview',
+        name: 'Funny YouTuber Definition T-Shirt',
+        productUrl:
+          'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt',
+        shortDescription: '<p>Rich subheadline from localized entry</p>',
+        featuresSpecs: '',
+        tags: ['YouTuber', 'Video Creator'],
+        updatedAt: '2026-03-01T00:00:00.000Z',
+      },
+      {
+        ...SEED_PRODUCTS[0],
+        id: 'prod-dup-canonical',
+        ownerId: 'local-preview',
+        name: 'Funny YouTuber Definition T-Shirt',
+        productUrl:
+          'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt',
+        shortDescription: '',
+        featuresSpecs: '<p>Detailed specs from canonical entry</p>',
+        tags: ['funny definition', 'youtuber'],
+        updatedAt: '2026-03-05T00:00:00.000Z',
+      },
+    ]);
+
+    expect(migratedCatalog.migratedCount).toBe(1);
+    expect(migratedCatalog.deduplicatedCount).toBe(1);
+    expect(migratedCatalog.products).toHaveLength(1);
+    expect(migratedCatalog.products[0].productUrl).toBe(
+      'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt'
+    );
+    expect(migratedCatalog.products[0].shortDescription).toBe(
+      '<p>Rich subheadline from localized entry</p>'
+    );
+    expect(migratedCatalog.products[0].featuresSpecs).toBe(
+      '<p>Detailed specs from canonical entry</p>'
+    );
+    expect(migratedCatalog.products[0].tags).toEqual([
+      'funny definition',
+      'youtuber',
+      'Video Creator',
+    ]);
+
+    // Saving and loading catalog products from local storage automatically normalizes URLs
+    saveLocalCatalogProducts([
+      {
+        ...SEED_PRODUCTS[0],
+        id: 'prod-persisted-en-usd',
+        ownerId: 'local-preview',
+        productUrl: 'https://shop.scienceofgifts.com/en-usd/products/roman-aquila-hoodie',
+      },
+    ]);
+    const loadedSync = loadLocalCatalogProducts()!;
+    expect(loadedSync).not.toBeNull();
+    expect(loadedSync[0].productUrl).toBe(
+      'https://shop.scienceofgifts.com/products/roman-aquila-hoodie'
+    );
+    const loadedAsync = (await loadLocalCatalogProductsAsync())!;
+    expect(loadedAsync).not.toBeNull();
+    expect(loadedAsync[0].productUrl).toBe(
+      'https://shop.scienceofgifts.com/products/roman-aquila-hoodie'
+    );
+
+    // 11c. Server fetch handler tries canonical URL first, and if that fails, retries original /en-usd/ URL while returning canonical productUrl
+    const fetchedUrls: string[] = [];
+    const mockFetch: typeof fetch = async (input) => {
+      const targetUrl = String(input);
+      fetchedUrls.push(targetUrl);
+      if (!targetUrl.includes('/en-usd/')) {
+        return new Response('Not Found', { status: 404 });
+      }
+      return new Response(
+        `<html><head>
+          <meta property="og:title" content="Funny YouTuber Definition T-Shirt" />
+          <meta property="og:image" content="https://cdn.fourthwall.com/youtuber.jpg" />
+          <meta property="product:price:amount" content="26.99" />
+          <link rel="canonical" href="https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt" />
+        </head><body></body></html>`,
+        {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+        }
+      );
+    };
+
+    const fetchResult = await handleProductFetchUrlRequest(
+      {
+        url: 'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt',
+      },
+      {},
+      { customFetch: mockFetch }
+    );
+
+    expect(fetchResult.status).toBe(200);
+    expect(fetchedUrls).toEqual([
+      'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt',
+      'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt',
+    ]);
+    const extracted = (
+      fetchResult.body as { extracted: { productUrl: string; name: string } }
+    ).extracted;
+    expect(extracted.name).toBe('Funny YouTuber Definition T-Shirt');
+    expect(extracted.productUrl).toBe(
+      'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt'
+    );
+  });
+
+  it('12. matches products consistently across catalog duplicate detection, CSV/JSON batch import, gift-guide HTML rendering, HTML workspace cards, JSON-LD schema, and Image Optimizer after URL normalization', () => {
+    const canonicalProduct = migrateAndHydrateProductRecord({
+      ...SEED_PRODUCTS[0],
+      id: 'prod-youtuber-1',
+      ownerId: 'local-preview',
+      name: 'Funny YouTuber Definition T-Shirt',
+      productUrl: 'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt',
+      imageUrl: 'https://cdn.fourthwall.com/youtuber-shirt.jpg',
+      price: '$24.99',
+    });
+
+    // 12a. Duplicate detection matches /en-usd/ URL against canonical catalog product
+    const duplicateMatch = findDuplicateProduct(
+      [canonicalProduct],
+      'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt'
+    );
+    expect(duplicateMatch?.id).toBe('prod-youtuber-1');
+
+    // 12b. Batch import normalizes /en-usd/ URLs and derives the exact same stable ID
+    const batchReport = parseProductImportBatch(
+      [
+        'name,productUrl,price,productType,category',
+        'Funny YouTuber Definition T-Shirt,https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt,$24.99,T-Shirt,General History',
+      ].join('\n')
+    );
+    expect(batchReport.validProducts).toHaveLength(1);
+    expect(batchReport.validProducts[0].productUrl).toBe(
+      'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt'
+    );
+    expect(batchReport.validProducts[0].id).toBe(
+      'prod-funny-youtuber-definition-t-shirt'
+    );
+
+    // 12c. Gift-guide section rendering outputs canonical URLs without /en-usd/
+    const productWithLocalizedUrl = {
+      ...canonicalProduct,
+      productUrl:
+        'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt',
+    };
+    const renderedSection = renderSectionHtml(
+      {
+        id: 'sec-test-norm',
+        ownerId: 'local-preview',
+        guideId: 'guide-test',
+        type: 'quick_picks',
+        title: 'Quick Picks',
+        anchorId: 'jump-qp',
+        order: 1,
+        enabled: true,
+        config: {
+          quickPicksHeading: 'Quick Picks',
+          quickPickCards: [
+            {
+              id: 'qp-card-1',
+              productId: productWithLocalizedUrl.id,
+              badgeText: 'Top Pick',
+              displayTitle: 'Funny YouTuber Definition T-Shirt',
+              metaDescription: 'Soft cotton tee',
+              priceDisplay: '$24.99',
+              productUrlOverride:
+                'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt',
+              imageUrlOverride: '',
+              ctaLabel: 'Shop Now',
+              order: 1,
+            },
+          ],
+        },
+      },
+      [productWithLocalizedUrl]
+    );
+    expect(renderedSection).toContain(
+      'href="https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt"'
+    );
+    expect(renderedSection).not.toContain('/en-usd/products/');
+
+    // 12d. HTML Workspace card replacement normalizes /en-usd/ URLs
+    const sampleCardHtml = `<section class="sog-editorial-section" id="sec-cards"><div class="sog-editorial-list"><article class="sog-ed-card"><div class="sog-ed-header"><div class="sog-ed-title-wrap"><h3 class="sog-ed-title"><a href="/en-usd/products/old-item">Old Item</a></h3></div></div><div class="sog-ed-grid"><div class="sog-ed-media"><a class="sog-ed-img-wrap" href="/en-usd/products/old-item"><img class="sog-ed-img" src="https://cdn.fourthwall.com/old.jpg" alt="Old"></a></div><div class="sog-ed-body"><a class="sog-ed-cta" href="/en-usd/products/old-item">Shop Now</a></div></div></article></div></section>`;
+    const cardAnalysis = analyzeHtmlDocument(sampleCardHtml);
+    const updatedCardHtml = applyCatalogProductToCard(
+      sampleCardHtml,
+      cardAnalysis.blocks[0].productCards[0],
+      productWithLocalizedUrl
+    );
+    expect(updatedCardHtml).toContain(
+      'href="https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt"'
+    );
+    expect(updatedCardHtml).not.toContain('/en-usd/products/');
+
+    // 12e. JSON-LD Schema generator outputs canonical URLs without /en-usd/
+    const jsonLd = generateGuideJsonLd(
+      {
+        ...SEED_GREEK_GUIDE,
+        ownerId: 'local-preview',
+        schemaConfig: {
+          ...SEED_GREEK_GUIDE.schemaConfig,
+          includedProductIds: [productWithLocalizedUrl.id],
+        },
+      },
+      [],
+      [productWithLocalizedUrl]
+    );
+    expect(jsonLd.formattedJson).toContain(
+      'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt'
+    );
+    expect(jsonLd.formattedJson).not.toContain('/en-usd/products/');
+
+    // 12f. Image Optimizer derives clean product slug and matches catalog products even if guide HTML or catalog had /en-usd/
+    expect(
+      deriveProductSlugFromUrl(
+        'https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt'
+      )
+    ).toBe('funny-youtuber-definition-t-shirt');
+    expect(
+      deriveProductSlugFromUrl('/en-usd/products/funny-youtuber-definition-t-shirt')
+    ).toBe('funny-youtuber-definition-t-shirt');
+
+    const guideHtmlWithEnUsdLink = `
+      <article class="sog-ed-card">
+        <div class="sog-ed-header">
+          <h3 class="sog-ed-title">
+            <a href="https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt">Funny YouTuber Definition T-Shirt</a>
+          </h3>
+        </div>
+        <div class="sog-ed-media">
+          <a href="https://shop.scienceofgifts.com/en-usd/products/funny-youtuber-definition-t-shirt">
+            <img src="https://cdn.fourthwall.com/youtuber-shirt.jpg" alt="Funny YouTuber Definition T-Shirt" />
+          </a>
+        </div>
+      </article>
+    `;
+    const scannedImages = scanGuideHtmlForImages(guideHtmlWithEnUsdLink, [canonicalProduct], []);
+    expect(scannedImages).toHaveLength(1);
+    expect(scannedImages[0].productSlug).toBe('funny-youtuber-definition-t-shirt');
+    expect(scannedImages[0].productId).toBe('prod-youtuber-1');
+    expect(scannedImages[0].productPageUrl).toBe(
+      'https://shop.scienceofgifts.com/products/funny-youtuber-definition-t-shirt'
+    );
+  });
+});
+
 
 
 

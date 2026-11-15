@@ -1,10 +1,14 @@
 import { ProductVariant } from '../types/cms';
 import {
+  deduplicateProductTags,
   detectProductType,
   findCanonicalOption,
   loadManagedCategories,
+  normalizeFourthwallProductUrl,
   normalizeTaxonomyLabel,
 } from './productCatalogTaxonomy';
+
+export { normalizeFourthwallProductUrl };
 
 export interface ExtractedProductData {
   name: string;
@@ -85,6 +89,7 @@ export function isPrivateOrInternalHost(hostname: string): boolean {
 export function validateFetchableProductUrl(rawUrl: string): {
   valid: boolean;
   normalizedUrl?: string;
+  originalFetchUrl?: string;
   error?: string;
 } {
   const trimmed = (rawUrl || '').trim();
@@ -126,7 +131,14 @@ export function validateFetchableProductUrl(rawUrl: string): {
     };
   }
 
-  return { valid: true, normalizedUrl: parsed.toString() };
+  const originalFetchUrl = parsed.toString();
+  const normalizedUrl = normalizeFourthwallProductUrl(originalFetchUrl) || originalFetchUrl;
+
+  return {
+    valid: true,
+    normalizedUrl,
+    ...(originalFetchUrl !== normalizedUrl ? { originalFetchUrl } : {}),
+  };
 }
 
 /**
@@ -443,7 +455,8 @@ export function extractProductFromHtml(
   if (!name) {
     const ogTitle = metaMap.get('og:title') || metaMap.get('twitter:title');
     if (ogTitle) {
-      name = ogTitle.replace(/\s*[|\-–—]\s*[^|\-–—]+$/, '').trim() || ogTitle;
+      name =
+        ogTitle.replace(/(?:\s*\|\s*|\s+[-–—]\s+)[^|\-–—]+$/, '').trim() || ogTitle;
       if (dataSource === 'html_meta') dataSource = 'open_graph';
     }
   }
@@ -452,7 +465,8 @@ export function extractProductFromHtml(
     const titleMatch = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
     if (titleMatch?.[1]) {
       const rawTitle = decodeHtmlEntities(titleMatch[1]);
-      name = rawTitle.replace(/\s*[|\-–—]\s*[^|\-–—]+$/, '').trim() || rawTitle;
+      name =
+        rawTitle.replace(/(?:\s*\|\s*|\s+[-–—]\s+)[^|\-–—]+$/, '').trim() || rawTitle;
     }
   }
 
@@ -619,12 +633,14 @@ export function extractProductFromHtml(
   const imageUrls = Array.from(imageSet).filter(Boolean).slice(0, 12);
   const primaryImage = imageUrls[0] || '';
   const featuresSpecs = specsList.join(' • ').slice(0, 3000);
-  const extractedTags = Array.from(tagsSet).slice(0, 20);
+  const extractedTags = deduplicateProductTags(Array.from(tagsSet));
+  const canonicalProductUrl =
+    normalizeFourthwallProductUrl(productUrl || sourceUrl) || productUrl || sourceUrl;
 
   // Infer product type locally from title, URL slug, metadata, tags, and description/specs
   const typeDetection = detectProductType({
     name,
-    productUrl,
+    productUrl: canonicalProductUrl,
     rawProductType: productType,
     category,
     shortDescription,
@@ -659,7 +675,7 @@ export function extractProductFromHtml(
 
   return {
     name: name.slice(0, 300),
-    productUrl: productUrl.slice(0, 1000),
+    productUrl: canonicalProductUrl.slice(0, 1000),
     price,
     originalPrice,
     currency: currency || (price ? 'USD' : ''),
