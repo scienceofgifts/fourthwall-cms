@@ -4,11 +4,15 @@ import dns from 'dns/promises';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { isPrivateOrInternalHost } from './src/services/productExtractor';
+import { processImageWithSharp } from './src/services/nodeSharpProcessor';
 import {
   ServerEnvironment,
   handleAiAnalyzeHtmlRequest,
   handleAiGenerateRequest,
   handleAiStatusRequest,
+  handleImageOptimizeRequest,
+  handleImageOptimizerStatusRequest,
+  handleImageUploadR2Request,
   handleProductFetchUrlRequest,
   handleProductParseHtmlRequest,
 } from './src/services/serverApiHandlers';
@@ -21,12 +25,21 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 function getServerEnv(): ServerEnvironment {
   return {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
     APP_URL: process.env.APP_URL,
+    R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
+    R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
+    R2_BUCKET_NAME: process.env.R2_BUCKET_NAME,
+    R2_PUBLIC_BASE_URL: process.env.R2_PUBLIC_BASE_URL,
+    R2_UPLOAD_AUTH_TOKEN: process.env.R2_UPLOAD_AUTH_TOKEN,
+    FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID,
+    CMS_AUTHORIZED_EMAILS: process.env.CMS_AUTHORIZED_EMAILS,
+    CMS_AUTHORIZED_UIDS: process.env.CMS_AUTHORIZED_UIDS,
   };
 }
 
@@ -50,6 +63,30 @@ async function assertPublicDnsResolution(hostname: string): Promise<void> {
 
 app.get('/api/ai/status', (_req, res) => {
   const result = handleAiStatusRequest(getServerEnv());
+  res.status(result.status).json(result.body);
+});
+
+app.get('/api/images/status', (_req, res) => {
+  const result = handleImageOptimizerStatusRequest(getServerEnv());
+  res.status(result.status).json(result.body);
+});
+
+app.post('/api/images/optimize', async (req, res) => {
+  const result = await handleImageOptimizeRequest(req.body, getServerEnv(), {
+    assertPublicDns: assertPublicDnsResolution,
+    imageProcessor: processImageWithSharp,
+  });
+  res.status(result.status).json(result.body);
+});
+
+app.post('/api/images/upload-r2', async (req, res) => {
+  const result = await handleImageUploadR2Request(
+    req.body,
+    getServerEnv(),
+    {
+      authorization: req.header('authorization') || undefined,
+    }
+  );
   res.status(result.status).json(result.body);
 });
 

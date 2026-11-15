@@ -28,7 +28,11 @@ import {
   loadLocalHtmlProjects,
   validateProjectBackupJson,
 } from '../services/firebase';
-import { buildFourthwallExportCode, resolveProjectCss } from '../services/htmlWorkspaceEngine';
+import {
+  buildFourthwallExportCode,
+  DEFAULT_GIFT_GUIDE_CSS,
+  resolveProjectCss,
+} from '../services/htmlWorkspaceEngine';
 
 interface ExportAndSchemaViewProps {
   guide: GiftGuide;
@@ -79,10 +83,16 @@ export const ExportAndSchemaView: React.FC<ExportAndSchemaViewProps> = ({
     return resolveProjectCss(activeProj);
   }, []);
 
+  const hasCustomGuideCss =
+    activeProjectCss.trim().length > 0 &&
+    activeProjectCss.trim() !== DEFAULT_GIFT_GUIDE_CSS.trim();
+
   const fullGuideHtml = useMemo(() => {
     const rawHtml = renderFullGuideHtml(sections, products, { forPreview: false });
-    return buildFourthwallExportCode(rawHtml, activeProjectCss, { includeCss: true });
-  }, [sections, products, activeProjectCss]);
+    return buildFourthwallExportCode(rawHtml, activeProjectCss, {
+      includeCss: hasCustomGuideCss,
+    });
+  }, [sections, products, activeProjectCss, hasCustomGuideCss]);
 
   const schemaResult = useMemo(
     () => generateGuideJsonLd(guide, sections, products),

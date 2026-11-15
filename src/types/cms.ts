@@ -296,7 +296,7 @@ export interface HtmlProjectSection {
 }
 
 export interface HtmlProjectEditorState {
-  viewMode: 'split' | 'visual' | 'raw' | 'css' | 'preview';
+  viewMode: 'split' | 'visual' | 'raw' | 'css' | 'images' | 'preview';
   selectedBlockId: string;
   sidebarTab?: 'blocks' | 'anchors';
   previewViewport: 'desktop' | 'mobile';
@@ -305,6 +305,21 @@ export interface HtmlProjectEditorState {
   sectionStartingNumbers?: Record<string, number>;
   sections?: HtmlProjectSection[];
 }
+
+export type HtmlProjectSyncStatus =
+  | 'saved_local_only'
+  | 'saved_local_and_cloud'
+  | 'saved_local_cloud_pending'
+  | 'saved_local_cloud_failed';
+
+export type StorageFailureCategory =
+  | 'idb_unavailable'
+  | 'idb_quota_exceeded'
+  | 'legacy_localstorage_quota'
+  | 'firestore_size_limit'
+  | 'firestore_permission_or_network'
+  | 'migration_failure'
+  | 'validation_error';
 
 export interface HtmlEditorProject {
   id: string;
@@ -318,6 +333,69 @@ export interface HtmlEditorProject {
   sections?: HtmlProjectSection[];
   createdAt: string;
   updatedAt: string;
+  syncStatus?: HtmlProjectSyncStatus;
+  syncDiagnostic?: string;
+  pendingCloudSync?: boolean;
+  lastCloudSyncedAt?: string;
 }
 
+export interface FourthwallHeaderCssSetting {
+  currentCss: string;
+  previousCss: string | null;
+  updatedAt: string;
+  isCustomized: boolean;
+  syncStatus?: HtmlProjectSyncStatus;
+  syncDiagnostic?: string;
+}
+
+export type ImageOptimizationStatus =
+  | 'not_optimized'
+  | 'optimized_locally'
+  | 'upload_pending'
+  | 'uploaded'
+  | 'link_updated'
+  | 'error';
+
+export type GuideImageRole = 'standard' | 'featured';
+
+export interface ImageDimensions {
+  width: number;
+  height: number;
+}
+
+export interface ProductImageMappingRecord {
+  id: string;
+  productPageUrl: string;
+  baseProductSlug?: string;
+  productSlug: string;
+  productId?: string;
+  productName?: string;
+  variantSuffix?: string;
+  filename?: string;
+  objectKey?: string;
+  r2ObjectKey?: string;
+  originalImageUrl: string;
+  optimizedImageUrl: string;
+  imageRole?: GuideImageRole;
+  role?: GuideImageRole;
+  originalDimensions?: ImageDimensions;
+  optimizedDimensions?: ImageDimensions;
+  originalFileSize?: number;
+  optimizedFileSize?: number;
+  originalFileSizeBytes?: number;
+  optimizedFileSizeBytes?: number;
+  maxWidth?: number;
+  targetMaxWidth?: number;
+  quality?: number;
+  status: ImageOptimizationStatus;
+  errorMessage?: string;
+  sourceContentHash?: string;
+  sourceChangedConflict?: boolean;
+  previousOriginalImageUrl?: string;
+  optimizedWebpBase64?: string;
+  lastOptimizedAt?: string;
+  lastUploadedAt?: string;
+}
+
+export type CatalogProduct = Product;
 

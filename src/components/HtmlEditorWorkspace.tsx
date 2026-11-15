@@ -32,8 +32,10 @@ import {
   Layers,
   Share2,
   Check,
+  Image as ImageIcon,
 } from 'lucide-react';
 import {
+  FourthwallHeaderCssSetting,
   GiftGuide,
   GuideSection,
   HtmlEditorProject,
@@ -83,11 +85,15 @@ import {
   createNewHtmlProject,
   deleteHtmlProject,
   duplicateHtmlProject,
+  FOURTHWALL_HEADER_CSS_UPDATED_EVENT,
+  getActiveHtmlProjectIdAsync,
   getActiveLocalHtmlProjectId,
+  getFourthwallHeaderCssSync,
+  loadFourthwallHeaderCssAsync,
   loadLocalHtmlProjects,
+  loadLocalHtmlProjectsAsync,
   renameHtmlProject,
   saveHtmlProject,
-  saveLocalHtmlProjectsList,
   setActiveLocalHtmlProjectId,
   subscribeToHtmlProjects,
 } from '../services/firebase';
@@ -106,6 +112,8 @@ import {
   EditorialFieldKey,
 } from './EditorialRichTextModal';
 import { sanitizeEditorialRichHtml } from '../services/editorialRichText';
+import { ImageOptimizerPanel } from './ImageOptimizerPanel';
+import { FourthwallHeaderCssEditor } from './FourthwallHeaderCssEditor';
 
 interface HtmlEditorWorkspaceProps {
   products: Product[];
@@ -123,8 +131,15 @@ interface ChangeLogEntry {
   description: string;
 }
 
-type WorkspaceViewMode = 'split' | 'visual' | 'raw' | 'css' | 'preview';
-type ProjectSaveStatus = 'saved' | 'saving' | 'unsaved' | 'error';
+type WorkspaceViewMode = 'split' | 'visual' | 'raw' | 'css' | 'images' | 'preview';
+type ProjectSaveStatus =
+  | 'saved'
+  | 'saved_local_and_cloud'
+  | 'saved_local_cloud_pending'
+  | 'saved_local_cloud_failed'
+  | 'saving'
+  | 'unsaved'
+  | 'error';
 type PasteDrawerMode = 'add_section' | 'replace_project' | null;
 
 const HTML_WORKSPACE_STORAGE_KEY = 'sog_html_workspace_session_v2';
@@ -227,13 +242,6 @@ function initializeProjectsState(
     },
     catalogProducts
   );
-
-  try {
-    saveLocalHtmlProjectsList([starterProject]);
-    setActiveLocalHtmlProjectId(starterProject.id);
-  } catch {
-    // ignore initial storage error; handled on explicit save
-  }
 
   return {
     projects: [starterProject],
@@ -380,6 +388,12 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
   const [confirmResetDefaultCss, setConfirmResetDefaultCss] = useState(false);
   const cssEditorTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
+  // Global Fourthwall Header CSS (Live Preview Reference) state
+  const [fourthwallHeaderCss, setFourthwallHeaderCss] = useState<string>(
+    () => getFourthwallHeaderCssSync().currentCss
+  );
+  const [showHeaderCssPanel, setShowHeaderCssPanel] = useState<boolean>(false);
+
   // Preview settings & iframe ref
   const [previewViewport, setPreviewViewport] = useState<'desktop' | 'mobile'>(
     initialData.activeProject.editorState?.previewViewport || 'desktop'
@@ -495,6 +509,32 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     }
   }, [currentCss, cssBufferDirty]);
 
+  // Sync Global Fourthwall Header CSS (Live Preview Reference) across storage & events
+  useEffect(() => {
+    let active = true;
+    void loadFourthwallHeaderCssAsync()
+      .then((setting) => {
+        if (active) {
+          setFourthwallHeaderCss(setting.currentCss);
+        }
+      })
+      .catch(() => {
+        // Keep current cached header CSS if initial async read fails
+      });
+
+    const handleHeaderCssUpdated = (event: Event) => {
+      const customEvt = event as CustomEvent<FourthwallHeaderCssSetting>;
+      const next = customEvt.detail || getFourthwallHeaderCssSync();
+      setFourthwallHeaderCss(next.currentCss);
+    };
+
+    window.addEventListener(FOURTHWALL_HEADER_CSS_UPDATED_EVENT, handleHeaderCssUpdated);
+    return () => {
+      active = false;
+      window.removeEventListener(FOURTHWALL_HEADER_CSS_UPDATED_EVENT, handleHeaderCssUpdated);
+    };
+  }, []);
+
   // Subscribe to Cloud Firestore HTML Projects when user is signed in
   useEffect(() => {
     if (!userId) return;
@@ -505,6 +545,40 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     });
     return () => unsub();
   }, [userId]);
+
+  // Hydrate projects asynchronously from IndexedDB (and complete one-time localStorage migration if needed)
+  useEffect(() => {
+    let mounted = true;
+    void (async () => {
+      try {
+        const [preferredId, hydrated] = await Promise.all([
+          getActiveHtmlProjectIdAsync(),
+          loadLocalHtmlProjectsAsync(),
+        ]);
+        if (!mounted) return;
+        if (hydrated.length > 0) {
+          setProjects(hydrated);
+          const target = hydrated.find((p) => p.id === preferredId) || hydrated[0];
+          if (target && !isProjectDirty) {
+            applyProjectToWorkspace(target);
+          }
+        } else {
+          // Only persist the starter project if IndexedDB is genuinely empty after hydration + migration
+          const savedStarter = await saveHtmlProject(initialData.activeProject, userId);
+          if (!mounted) return;
+          const refreshed = await loadLocalHtmlProjectsAsync();
+          if (!mounted) return;
+          setProjects(refreshed.length > 0 ? refreshed : [savedStarter]);
+        }
+      } catch (err) {
+        console.warn('IndexedDB initial hydration notice:', err);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Run deterministic DOM/AST analysis across all ordered sections in the active project
   const analysis = useMemo(
@@ -528,18 +602,28 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
   );
 
   const effectiveCss = cssBufferDirty ? cssEditorBuffer : currentCss;
+  const hasCustomGuideCss =
+    effectiveCss.trim().length > 0 && effectiveCss.trim() !== DEFAULT_GIFT_GUIDE_CSS.trim();
 
-  // Total project export evaluation (character count & Fourthwall 30k limit status, including active CSS when enabled)
+  // Total project export evaluation (informational total character count across all sections; never injects Header CSS)
   const completeProjectExportStatus = useMemo(
     () =>
       evaluateHtmlExportSize(
         buildFourthwallExportCode(
           rawBufferDirty ? rawEditorBuffer : currentHtml,
           effectiveCss,
-          { includeCss: includeFourthwallCss }
-        )
+          { includeCss: hasCustomGuideCss && includeFourthwallCss }
+        ),
+        { scope: 'complete_project' }
       ),
-    [currentHtml, effectiveCss, includeFourthwallCss, rawBufferDirty, rawEditorBuffer]
+    [
+      currentHtml,
+      effectiveCss,
+      hasCustomGuideCss,
+      includeFourthwallCss,
+      rawBufferDirty,
+      rawEditorBuffer,
+    ]
   );
 
   // Determine whether the active project has genuinely unsaved edits compared to its last persisted state
@@ -678,20 +762,15 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
           return true;
         }
         try {
-          window.localStorage.setItem(
-            HTML_WORKSPACE_STORAGE_KEY,
-            JSON.stringify({
-              originalHtml: saved.originalHtml,
-              currentHtml: saved.currentHtml,
-            })
-          );
+          window.localStorage.removeItem(HTML_WORKSPACE_STORAGE_KEY);
         } catch {
-          // ignore legacy session write error
+          // ignore legacy session cleanup error
         }
 
         const savedSections = saved.sections || saved.editorState?.sections || effectiveSections;
         const savedCss = resolveProjectCss(saved);
-        setProjects(loadLocalHtmlProjects());
+        const refreshedProjects = await loadLocalHtmlProjectsAsync();
+        setProjects(refreshedProjects);
         setLastSavedSnapshot({
           id: saved.id,
           name: saved.name,
@@ -703,10 +782,29 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
           sectionStartingNumbersJson: JSON.stringify(effectiveStartingNumbers),
         });
         setLastSavedAt(saved.updatedAt);
-        setSaveStatus('saved');
-        setSaveError(null);
+        if (saved.syncStatus === 'saved_local_and_cloud') {
+          setSaveStatus('saved_local_and_cloud');
+          setSaveError(null);
+        } else if (saved.syncStatus === 'saved_local_cloud_pending') {
+          setSaveStatus('saved_local_cloud_pending');
+          setSaveError(saved.syncDiagnostic || null);
+        } else if (saved.syncStatus === 'saved_local_cloud_failed') {
+          setSaveStatus('saved_local_cloud_failed');
+          setSaveError(saved.syncDiagnostic || 'Cloud sync failed');
+        } else {
+          setSaveStatus('saved');
+          setSaveError(null);
+        }
         if (options?.showToastOnSuccess) {
-          onShowToast?.(`Saved project "${saved.name}".`);
+          onShowToast?.(
+            saved.syncStatus === 'saved_local_and_cloud'
+              ? `Saved "${saved.name}" locally and synced to Firestore.`
+              : saved.syncStatus === 'saved_local_cloud_pending'
+              ? `Saved "${saved.name}" locally (cloud sync pending).`
+              : saved.syncStatus === 'saved_local_cloud_failed'
+              ? `Saved "${saved.name}" locally, but cloud sync failed.`
+              : `Saved project "${saved.name}".`
+          );
         }
         return true;
       } catch (err) {
@@ -826,8 +924,16 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
         sectionStartingNumbersJson: JSON.stringify(projStartingNumbers),
       });
       setLastSavedAt(proj.updatedAt);
-      setSaveStatus('saved');
-      setSaveError(null);
+      if (proj.syncStatus === 'saved_local_and_cloud') {
+        setSaveStatus('saved_local_and_cloud');
+      } else if (proj.syncStatus === 'saved_local_cloud_pending') {
+        setSaveStatus('saved_local_cloud_pending');
+      } else if (proj.syncStatus === 'saved_local_cloud_failed') {
+        setSaveStatus('saved_local_cloud_failed');
+      } else {
+        setSaveStatus('saved');
+      }
+      setSaveError(proj.syncDiagnostic || null);
       setChangeLog([
         {
           id: `open-${Date.now()}`,
@@ -1082,7 +1188,8 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
           sectionStartingNumbers: freshStartingNumbers,
         },
       });
-      setProjects(loadLocalHtmlProjects());
+      const refreshed = await loadLocalHtmlProjectsAsync();
+      setProjects(refreshed);
       applyProjectToWorkspace(created);
       setShowNewProjectModal(false);
       onShowToast?.(`Created and saved new project "${created.name}".`);
@@ -1553,9 +1660,10 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
     return buildPreviewIframeDocument(
       safePreviewBodyHtml,
       effectiveCss,
-      includeFourthwallCss
+      includeFourthwallCss,
+      fourthwallHeaderCss
     );
-  }, [safePreviewBodyHtml, effectiveCss, includeFourthwallCss]);
+  }, [safePreviewBodyHtml, effectiveCss, includeFourthwallCss, fourthwallHeaderCss]);
 
   const handlePreviewIframeLoad = useCallback(() => {
     try {
@@ -1598,7 +1706,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
             exportIncludeCss ? ' · Includes Active CSS Stylesheet' : ' · HTML Only'
           }`,
           fileBaseName: `${projectName}-${sec.name}`,
-          ...evaluateHtmlExportSize(sectionCode),
+          ...evaluateHtmlExportSize(sectionCode, { scope: 'section' }),
         };
       }
     }
@@ -1612,7 +1720,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
         exportIncludeCss ? ' + Active Gift Guide CSS (<style>...)' : ' (HTML Only)'
       }`,
       fileBaseName: projectName,
-      ...evaluateHtmlExportSize(completeCode),
+      ...evaluateHtmlExportSize(completeCode, { scope: 'complete_project' }),
     };
   }, [
     effectiveCss,
@@ -2307,7 +2415,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
             className="px-2.5 py-1 bg-white border border-[#C8C0B0] rounded-md font-editorial font-semibold text-sm text-[#111A27] focus:outline-none focus:border-[#1A567B] w-60 sm:w-72"
           />
 
-          {/* Visible Save State Indicator: Saving… | Saved | Unsaved changes | Actionable Error */}
+          {/* Visible Save State Indicator: Saving… | Saved / Synced | Pending Cloud Sync | Cloud Sync Failed | Local Save Failed */}
           {saveStatus === 'saving' && (
             <span
               role="status"
@@ -2318,7 +2426,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
             </span>
           )}
 
-          {saveStatus === 'saved' && !isProjectDirty && (
+          {(saveStatus === 'saved' || saveStatus === 'saved_local_and_cloud') && !isProjectDirty && (
             <span
               role="status"
               className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#E1F2EA] text-[#134634] border border-[#96CDB0] font-semibold"
@@ -2326,13 +2434,55 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
             >
               <CheckCircle2 className="w-3.5 h-3.5" />
               <span>
-                Saved ·{' '}
+                {saveStatus === 'saved_local_and_cloud'
+                  ? 'Saved locally and synced to Firestore'
+                  : 'Saved'}{' '}
+                ·{' '}
                 {new Date(lastSavedAt).toLocaleTimeString([], {
                   hour: '2-digit',
                   minute: '2-digit',
                 })}
               </span>
             </span>
+          )}
+
+          {saveStatus === 'saved_local_cloud_pending' && !isProjectDirty && (
+            <span
+              role="status"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-50 text-amber-900 border border-amber-300 font-semibold"
+              title={saveError || 'Saved locally in IndexedDB; waiting for Firestore connection.'}
+            >
+              <CheckCircle2 className="w-3.5 h-3.5 text-amber-700" />
+              <span>
+                Saved locally, cloud sync pending ·{' '}
+                {new Date(lastSavedAt).toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })}
+              </span>
+            </span>
+          )}
+
+          {saveStatus === 'saved_local_cloud_failed' && !isProjectDirty && (
+            <div
+              role="alert"
+              className="inline-flex items-center gap-2 px-2.5 py-1 rounded-md bg-amber-50 text-amber-950 border border-amber-400 font-semibold"
+            >
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+              <span
+                className="truncate max-w-xs"
+                title={saveError || 'Saved locally in IndexedDB, but Cloud Firestore sync failed.'}
+              >
+                Saved locally · Cloud sync failed: {saveError || 'Firestore sync error'}
+              </span>
+              <button
+                type="button"
+                onClick={() => void performSaveActiveProject({ showToastOnSuccess: true })}
+                className="px-2 py-0.5 bg-amber-800 hover:bg-amber-900 text-white rounded text-[11px] font-semibold shrink-0"
+              >
+                Retry Sync
+              </button>
+            </div>
           )}
 
           {saveStatus !== 'saving' && saveStatus !== 'error' && isProjectDirty && (
@@ -2351,8 +2501,8 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
               className="inline-flex items-center gap-2 px-2.5 py-1 rounded-md bg-red-50 text-red-900 border border-red-300 font-semibold"
             >
               <AlertCircle className="w-3.5 h-3.5 text-red-700 shrink-0" />
-              <span className="truncate max-w-xs" title={saveError || 'Save failed'}>
-                Save failed: {saveError || 'Storage error'}
+              <span className="truncate max-w-xs" title={saveError || 'Local save failed'}>
+                Local save failed: {saveError || 'Storage error'}
               </span>
               <button
                 type="button"
@@ -2403,8 +2553,9 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
 
           <button
             type="button"
-            onClick={() => {
-              setProjects(loadLocalHtmlProjects());
+            onClick={async () => {
+              const latest = await loadLocalHtmlProjectsAsync();
+              setProjects(latest.length > 0 ? latest : loadLocalHtmlProjects());
               setRenamingProjectId(null);
               setConfirmDeleteProjectId(null);
               setShowProjectsModal(true);
@@ -2478,10 +2629,6 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
           </button>
 
           <div className="flex items-center gap-2 text-[#334155]">
-            <span className="font-mono-tabular font-semibold text-[#111A27]">
-              {sections.length} section(s)
-            </span>
-            <span>·</span>
             <span className="font-mono-tabular">
               {analysis.stats.productCardCount} product card(s) ({analysis.stats.matchedCatalogCount}{' '}
               matched)
@@ -2494,22 +2641,13 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
                 setExportIncludeCss(true);
                 setExportModalTarget({ mode: 'complete_project' });
               }}
-              className={`font-mono-tabular px-2 py-0.5 rounded border text-[11px] font-semibold inline-flex items-center gap-1 ${
-                completeProjectExportStatus.exceedsFourthwallLimit
-                  ? 'bg-red-50 text-red-900 border-red-300'
-                  : completeProjectExportStatus.approachingFourthwallLimit
-                  ? 'bg-amber-50 text-amber-900 border-amber-300'
-                  : 'bg-white text-[#334155] border-[#D5CFC0]'
-              }`}
-              title="Click to inspect character count and export options for Fourthwall (30,000 char limit per block)"
+              className="font-mono-tabular px-2.5 py-0.5 rounded border text-[11px] font-semibold inline-flex items-center gap-1.5 bg-white text-[#334155] border-[#D5CFC0] hover:border-[#1A567B]"
+              title="Informational total project character count across all sections. Click to open the export inspector."
             >
               <span>
-                {completeProjectExportStatus.characterCount.toLocaleString()} /{' '}
-                {FOURTHWALL_CHAR_LIMIT.toLocaleString()} chars
+                Total Guide: {completeProjectExportStatus.characterCount.toLocaleString()}{' '}
+                characters | {sections.length} {sections.length === 1 ? 'section' : 'sections'}
               </span>
-              {completeProjectExportStatus.exceedsFourthwallLimit && (
-                <AlertTriangle className="w-3 h-3 text-red-700" />
-              )}
             </button>
             {analysis.validationIssues.length > 0 && (
               <>
@@ -2575,6 +2713,18 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
           >
             <FileCode className="w-3.5 h-3.5" />
             <span>CSS Editor{cssBufferDirty ? ' *' : ''}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSwitchViewMode('images')}
+            className={`px-2.5 py-1 rounded-md font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+              viewMode === 'images'
+                ? 'bg-[#111A27] text-white'
+                : 'text-[#334155] hover:text-[#111A27]'
+            }`}
+          >
+            <ImageIcon className="w-3.5 h-3.5" />
+            <span>Image Optimizer</span>
           </button>
           <button
             type="button"
@@ -2660,7 +2810,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
             type="button"
             onClick={() => {
               setExportCopyFeedback(null);
-              setExportIncludeCss(true);
+              setExportIncludeCss(hasCustomGuideCss);
               setExportModalTarget({ mode: 'complete_project' });
             }}
             className="sog-btn-powder"
@@ -2673,10 +2823,10 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
             type="button"
             onClick={() => {
               const exportedHtml = rawBufferDirty ? rawEditorBuffer : currentHtml;
-              const exportedWithCss = buildFourthwallExportCode(exportedHtml, effectiveCss, {
-                includeCss: includeFourthwallCss,
+              const exportedCode = buildFourthwallExportCode(exportedHtml, effectiveCss, {
+                includeCss: hasCustomGuideCss && includeFourthwallCss,
               });
-              handleDownloadHtmlFile(exportedWithCss, projectName);
+              handleDownloadHtmlFile(exportedCode, projectName);
             }}
             className="sog-btn-secondary"
           >
@@ -2688,12 +2838,12 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
             type="button"
             onClick={() => {
               const exportedHtml = rawBufferDirty ? rawEditorBuffer : currentHtml;
-              const exportedWithCss = buildFourthwallExportCode(exportedHtml, effectiveCss, {
-                includeCss: includeFourthwallCss,
+              const exportedCode = buildFourthwallExportCode(exportedHtml, effectiveCss, {
+                includeCss: hasCustomGuideCss && includeFourthwallCss,
               });
               void handleCopyHtmlWithFallback(
-                exportedWithCss,
-                'complete Fourthwall CSS + HTML'
+                exportedCode,
+                hasCustomGuideCss ? 'complete Fourthwall CSS + HTML' : 'complete Fourthwall HTML'
               );
             }}
             className="sog-btn-mint"
@@ -2703,6 +2853,18 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
           </button>
         </div>
       </div>
+
+      {/* GLOBAL FOURTHWALL HEADER CSS (LIVE PREVIEW REFERENCE) DRAWER */}
+      {showHeaderCssPanel && (
+        <div className="bg-[#F3EFE6] border-b border-[#D5CFC0] px-6 py-4">
+          <FourthwallHeaderCssEditor
+            userId={userId}
+            onShowToast={onShowToast}
+            onClosePanel={() => setShowHeaderCssPanel(false)}
+            compact
+          />
+        </div>
+      )}
 
       {/* DRAWER 1: ADD HTML SECTION (Appends without replacing existing sections) */}
       {pasteDrawerMode === 'add_section' && (
@@ -2957,7 +3119,10 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
       {/* MAIN 3-COLUMN WORKSPACE BODY */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* LEFT SIDEBAR: MULTI-SECTION STRUCTURE NAVIGATOR & ANCHOR ID INSPECTOR */}
-        {viewMode !== 'preview' && viewMode !== 'raw' && viewMode !== 'css' && (
+        {viewMode !== 'preview' &&
+          viewMode !== 'raw' &&
+          viewMode !== 'css' &&
+          viewMode !== 'images' && (
           <aside className="w-76 bg-[#F2EDE2] border-r border-[#D5CFC0] flex flex-col shrink-0 select-none">
             <div className="p-3 border-b border-[#D5CFC0] flex items-center gap-1 bg-[#EAE3D5]">
               <button
@@ -3403,11 +3568,9 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
                                 className={`text-[11px] font-mono-tabular px-1.5 py-0.5 rounded shrink-0 ${
                                   sectionExportEval.exceedsFourthwallLimit
                                     ? 'bg-red-600 text-white font-bold'
-                                    : sectionExportEval.approachingFourthwallLimit
-                                    ? 'bg-amber-500 text-[#111A27] font-semibold'
                                     : 'bg-[#1E2E46] text-[#94C0D6]'
                                 }`}
-                                title={`Section HTML size: ${sectionExportEval.characterCount.toLocaleString()} characters (Fourthwall limit: 30,000 chars)`}
+                                title={`Section HTML size: ${sectionExportEval.characterCount.toLocaleString()} characters (Fourthwall per-section limit: ${FOURTHWALL_CHAR_LIMIT.toLocaleString()} chars)`}
                               >
                                 {sectionExportEval.characterCount.toLocaleString()} chars
                               </span>
@@ -3647,15 +3810,11 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
                     </div>
 
                     <div className="p-5 space-y-5 text-xs">
-                      {/* Fourthwall 30,000-character warning banner on individual section if applicable */}
-                      {sectionExportEval.warningMessage && (
+                      {/* Fourthwall 30,000-character warning banner ONLY when this individual section exceeds the limit */}
+                      {sectionExportEval.exceedsFourthwallLimit && sectionExportEval.warningMessage && (
                         <div
                           role="status"
-                          className={`px-3.5 py-2.5 rounded-lg border flex items-start justify-between gap-3 text-[11px] ${
-                            sectionExportEval.exceedsFourthwallLimit
-                              ? 'bg-red-50 border-red-300 text-red-900'
-                              : 'bg-amber-50 border-amber-300 text-amber-950'
-                          }`}
+                          className="px-3.5 py-2.5 rounded-lg border flex items-start justify-between gap-3 text-[11px] bg-red-50 border-red-300 text-red-900"
                         >
                           <div className="flex items-start gap-2">
                             <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
@@ -4873,7 +5032,41 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
               }}
               spellCheck={false}
               placeholder="Write or paste your Gift Guide CSS rules here..."
-              className="flex-1 w-full p-4 bg-[#111926] text-[#E6EEF8] rounded-xl font-mono-tabular text-xs leading-relaxed focus:outline-none border border-[#2C3E58]"
+              className="flex-1 min-h-[260px] w-full p-4 bg-[#111926] text-[#E6EEF8] rounded-xl font-mono-tabular text-xs leading-relaxed focus:outline-none border border-[#2C3E58]"
+            />
+
+            {/* Global Fourthwall Header CSS (Live Preview Reference) inside CSS Workspace */}
+            <FourthwallHeaderCssEditor userId={userId} onShowToast={onShowToast} compact />
+          </main>
+        )}
+
+        {/* BULK PRODUCT IMAGE OPTIMIZER & CLOUDFLARE R2 PUBLISHER MODE */}
+        {viewMode === 'images' && (
+          <main className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
+            <ImageOptimizerPanel
+              currentHtml={rawBufferDirty ? rawEditorBuffer : currentHtml}
+              products={products}
+              onApplyHtmlImageReplacements={(nextHtml, summaryMessage) => {
+                const snapshot = buildCurrentWorkspaceProjectSnapshot();
+                const updatedProj = replaceProjectHtmlContent(
+                  snapshot,
+                  nextHtml,
+                  undefined,
+                  products
+                );
+                commitUpdatedProjectState(
+                  {
+                    ...updatedProj,
+                    originalHtml,
+                    customCss: effectiveCss,
+                  },
+                  summaryMessage,
+                  {
+                    persistImmediately: true,
+                    toastMessage: summaryMessage,
+                  }
+                );
+              }}
             />
           </main>
         )}
@@ -4892,7 +5085,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
                   Isolated Storefront Preview ({sections.length} section{sections.length === 1 ? '' : 's'})
                 </span>
                 <span className="text-[11px] text-[#94A3B8]">
-                  (Synced with CSS Editor)
+                  (Synced with Header &amp; Guide CSS)
                 </span>
               </div>
 
@@ -4906,6 +5099,19 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
                   />
                   <span>Apply Guide CSS</span>
                 </label>
+
+                <button
+                  type="button"
+                  onClick={() => setShowHeaderCssPanel((prev) => !prev)}
+                  className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-colors ${
+                    showHeaderCssPanel
+                      ? 'bg-[#DFEEF5] text-[#111A27]'
+                      : 'bg-[#22314A] hover:bg-[#2F4363] text-[#DFEEF5]'
+                  }`}
+                  title="Edit or replace the global Fourthwall Header CSS (Live Preview Reference)"
+                >
+                  Fourthwall Header CSS
+                </button>
 
                 <button
                   type="button"
@@ -5012,24 +5218,39 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
                   {completeProjectExportStatus.characterCount.toLocaleString()} chars)
                 </button>
 
-                {sections.map((sec, idx) => (
-                  <button
-                    key={sec.id}
-                    type="button"
-                    onClick={() => {
-                      setExportCopyFeedback(null);
-                      setExportModalTarget({ mode: 'section', sectionId: sec.id });
-                    }}
-                    className={`px-2.5 py-1 rounded-md font-semibold transition-colors ${
-                      exportModalTarget.mode === 'section' && exportModalTarget.sectionId === sec.id
-                        ? 'bg-[#1A567B] text-white'
-                        : 'bg-white text-[#334155] border border-[#D5CFC0]'
-                    }`}
-                  >
-                    {String(idx + 1).padStart(2, '0')}. {sec.name} ({sec.htmlContent.length.toLocaleString()}{' '}
-                    chars)
-                  </button>
-                ))}
+                {sections.map((sec, idx) => {
+                  const secExportCode = buildFourthwallExportCode(sec.htmlContent, effectiveCss, {
+                    includeCss: exportIncludeCss,
+                  });
+                  const secEval = evaluateHtmlExportSize(secExportCode, { scope: 'section' });
+                  const isSelectedSec =
+                    exportModalTarget.mode === 'section' && exportModalTarget.sectionId === sec.id;
+                  return (
+                    <button
+                      key={sec.id}
+                      type="button"
+                      onClick={() => {
+                        setExportCopyFeedback(null);
+                        setExportModalTarget({ mode: 'section', sectionId: sec.id });
+                      }}
+                      className={`px-2.5 py-1 rounded-md font-semibold inline-flex items-center gap-1 transition-colors ${
+                        isSelectedSec
+                          ? 'bg-[#1A567B] text-white'
+                          : secEval.exceedsFourthwallLimit
+                          ? 'bg-red-50 text-red-900 border border-red-300'
+                          : 'bg-white text-[#334155] border border-[#D5CFC0]'
+                      }`}
+                    >
+                      <span>
+                        {String(idx + 1).padStart(2, '0')}. {sec.name} (
+                        {secEval.characterCount.toLocaleString()} chars)
+                      </span>
+                      {secEval.exceedsFourthwallLimit && (
+                        <AlertTriangle className="w-3 h-3 shrink-0" />
+                      )}
+                    </button>
+                  );
+                })}
               </div>
 
               <label className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-white border border-[#C8C0B0] rounded-md font-semibold text-[11px] text-[#111A27] cursor-pointer">
@@ -5042,42 +5263,61 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
               </label>
             </div>
 
-            {/* Character Count & Fourthwall 30,000-Char Limit Status Bar */}
-            <div
-              className={`p-3.5 rounded-xl border space-y-2 ${
-                activeExportPayload.exceedsFourthwallLimit
-                  ? 'bg-red-50 border-red-300 text-red-950'
-                  : activeExportPayload.approachingFourthwallLimit
-                  ? 'bg-amber-50 border-amber-300 text-amber-950'
-                  : 'bg-[#E1F2EA] border-[#96CDB0] text-[#134634]'
-              }`}
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2 font-semibold">
-                  {activeExportPayload.exceedsFourthwallLimit ||
-                  activeExportPayload.approachingFourthwallLimit ? (
-                    <AlertTriangle className="w-4 h-4 shrink-0" />
-                  ) : (
-                    <CheckCircle2 className="w-4 h-4 shrink-0" />
-                  )}
-                  <span>
-                    Character Count: {activeExportPayload.characterCount.toLocaleString()} /{' '}
-                    {FOURTHWALL_CHAR_LIMIT.toLocaleString()} characters
+            {/* Character Count Status Bar: Neutral informational for Complete Project, per-section limit validation for individual sections */}
+            {exportModalTarget.mode === 'complete_project' ? (
+              <div className="p-3.5 rounded-xl border bg-white border-[#D5CFC0] text-[#111A27] space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 font-semibold">
+                    <CheckCircle2 className="w-4 h-4 text-[#1A567B] shrink-0" />
+                    <span>
+                      Total Guide: {activeExportPayload.characterCount.toLocaleString()} characters |{' '}
+                      {sections.length} {sections.length === 1 ? 'section' : 'sections'}
+                    </span>
+                  </div>
+                  <span className="font-mono-tabular text-[11px] text-[#5E6B7C]">
+                    Complete Assembled Guide (Informational Count)
                   </span>
                 </div>
-                <span className="font-mono-tabular text-[11px] font-bold">
-                  {activeExportPayload.exceedsFourthwallLimit
-                    ? `Exceeds limit by ${(
-                        activeExportPayload.characterCount - FOURTHWALL_CHAR_LIMIT
-                      ).toLocaleString()} chars`
-                    : `${activeExportPayload.remainingCharacters.toLocaleString()} chars remaining under 30k limit`}
-                </span>
+                <p className="text-[11px] text-[#5E6B7C] leading-relaxed">
+                  Fourthwall&apos;s {FOURTHWALL_CHAR_LIMIT.toLocaleString()}-character limit applies
+                  only to individual custom HTML sections, not to your complete assembled guide. Select
+                  any individual section above to inspect or copy it for Fourthwall.
+                </p>
               </div>
+            ) : (
+              <div
+                className={`p-3.5 rounded-xl border space-y-2 ${
+                  activeExportPayload.exceedsFourthwallLimit
+                    ? 'bg-red-50 border-red-300 text-red-950'
+                    : 'bg-[#E1F2EA] border-[#96CDB0] text-[#134634]'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 font-semibold">
+                    {activeExportPayload.exceedsFourthwallLimit ? (
+                      <AlertTriangle className="w-4 h-4 shrink-0" />
+                    ) : (
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    )}
+                    <span>
+                      Section Character Count: {activeExportPayload.characterCount.toLocaleString()} /{' '}
+                      {FOURTHWALL_CHAR_LIMIT.toLocaleString()} characters
+                    </span>
+                  </div>
+                  <span className="font-mono-tabular text-[11px] font-bold">
+                    {activeExportPayload.exceedsFourthwallLimit
+                      ? `Exceeds section limit by ${(
+                          activeExportPayload.characterCount - FOURTHWALL_CHAR_LIMIT
+                        ).toLocaleString()} chars`
+                      : `${activeExportPayload.remainingCharacters.toLocaleString()} chars remaining under 30k section limit`}
+                  </span>
+                </div>
 
-              {activeExportPayload.warningMessage && (
-                <p className="text-[11px] leading-relaxed">{activeExportPayload.warningMessage}</p>
-              )}
-            </div>
+                {activeExportPayload.exceedsFourthwallLimit && activeExportPayload.warningMessage && (
+                  <p className="text-[11px] leading-relaxed">{activeExportPayload.warningMessage}</p>
+                )}
+              </div>
+            )}
 
             {/* Copy Feedback Banner */}
             {exportCopyFeedback && (
@@ -5619,7 +5859,8 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
                               if (!clean) return;
                               try {
                                 const updated = await renameHtmlProject(proj.id, clean, userId);
-                                setProjects(loadLocalHtmlProjects());
+                                const refreshed = await loadLocalHtmlProjectsAsync();
+                                setProjects(refreshed);
                                 if (proj.id === activeProjectId) {
                                   setProjectName(updated.name);
                                   setLastSavedSnapshot((prev) => ({
@@ -5694,8 +5935,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
                               type="button"
                               onClick={async () => {
                                 try {
-                                  await deleteHtmlProject(proj.id, userId);
-                                  const remaining = loadLocalHtmlProjects();
+                                  const remaining = await deleteHtmlProject(proj.id, userId);
                                   setConfirmDeleteProjectId(null);
 
                                   if (proj.id === activeProjectId) {
@@ -5709,7 +5949,7 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
                                         baseUrl: defaultBaseUrl,
                                         userId,
                                       });
-                                      const refreshed = loadLocalHtmlProjects();
+                                      const refreshed = await loadLocalHtmlProjectsAsync();
                                       setProjects(refreshed);
                                       applyProjectToWorkspace(fresh);
                                     }
@@ -5772,7 +6012,8 @@ export const HtmlEditorWorkspace: React.FC<HtmlEditorWorkspaceProps> = ({
                                     undefined,
                                     userId
                                   );
-                                  setProjects(loadLocalHtmlProjects());
+                                  const refreshed = await loadLocalHtmlProjectsAsync();
+                                  setProjects(refreshed);
                                   onShowToast?.(`Duplicated project as "${copy.name}".`);
                                 } catch (err) {
                                   onShowToast?.(

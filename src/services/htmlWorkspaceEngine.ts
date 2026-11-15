@@ -3535,6 +3535,12 @@ export function attachPreviewImageFallbacks(doc: Document | null | undefined): v
 export const FOURTHWALL_CHAR_LIMIT = 30_000;
 export const FOURTHWALL_CHAR_WARNING_THRESHOLD = 25_000;
 
+export interface EvaluateHtmlExportOptions {
+  scope?: 'section' | 'complete_project';
+  includeCss?: boolean;
+  customCss?: string;
+}
+
 export interface HtmlExportPayload {
   html: string;
   charCount: number;
@@ -3550,12 +3556,37 @@ export interface HtmlExportPayload {
 }
 
 /**
- * Evaluates an exported HTML string against Fourthwall's 30,000-character paste limit.
+ * Evaluates an exported HTML string against Fourthwall's per-section 30,000-character custom code block limit.
+ * When `options.scope === 'complete_project'`, returns neutral character statistics without applying per-section limit warnings.
  * Never truncates, splits, or modifies the HTML content.
  */
-export function evaluateHtmlExportSize(html: string): HtmlExportPayload {
-  const safeHtml = typeof html === 'string' ? html : '';
+export function evaluateHtmlExportSize(
+  html: string,
+  options?: EvaluateHtmlExportOptions
+): HtmlExportPayload {
+  const rawSafeHtml = typeof html === 'string' ? html : '';
+  const safeHtml =
+    options?.includeCss && typeof options.customCss === 'string'
+      ? buildFourthwallExportCode(rawSafeHtml, options.customCss, { includeCss: true })
+      : rawSafeHtml;
   const charCount = safeHtml.length;
+
+  if (options?.scope === 'complete_project') {
+    return {
+      html: safeHtml,
+      charCount,
+      characterCount: charCount,
+      approachesLimit: false,
+      approachingFourthwallLimit: false,
+      exceedsLimit: false,
+      exceedsFourthwallLimit: false,
+      remainingChars: 0,
+      remainingCharacters: 0,
+      overLimitChars: 0,
+      warningMessage: undefined,
+    };
+  }
+
   const exceedsLimit = charCount > FOURTHWALL_CHAR_LIMIT;
   const approachesLimit = !exceedsLimit && charCount >= FOURTHWALL_CHAR_WARNING_THRESHOLD;
   const remainingChars = Math.max(0, FOURTHWALL_CHAR_LIMIT - charCount);
@@ -3563,9 +3594,9 @@ export function evaluateHtmlExportSize(html: string): HtmlExportPayload {
 
   let warningMessage: string | undefined;
   if (exceedsLimit) {
-    warningMessage = `This HTML is ${charCount.toLocaleString()} characters, which exceeds Fourthwall's 30,000-character limit by ${overLimitChars.toLocaleString()} characters. Export individual sections to paste into Fourthwall without truncation.`;
+    warningMessage = `This section is ${charCount.toLocaleString()} characters, which exceeds Fourthwall's ${FOURTHWALL_CHAR_LIMIT.toLocaleString()}-character limit by ${overLimitChars.toLocaleString()} characters. Export individual sections to paste into Fourthwall without truncation.`;
   } else if (approachesLimit) {
-    warningMessage = `This HTML is ${charCount.toLocaleString()} characters, approaching Fourthwall's 30,000-character limit (${remainingChars.toLocaleString()} characters remaining).`;
+    warningMessage = `This section is ${charCount.toLocaleString()} characters, approaching Fourthwall's ${FOURTHWALL_CHAR_LIMIT.toLocaleString()}-character limit (${remainingChars.toLocaleString()} characters remaining).`;
   }
 
   return {
@@ -3870,6 +3901,47 @@ export function buildSectionStartingNumbersMap(
 export const DEFAULT_GIFT_GUIDE_CSS = LOCKED_FOURTHWALL_CSS.trim();
 
 /**
+ * Normalizes a CSS stylesheet input (raw CSS or wrapped in one or more `<style>...</style>` blocks)
+ * into a single clean stylesheet without duplicated `<style>` wrappers and without truncating large files.
+ */
+export function normalizeHeaderCssInput(rawInput: string): string {
+  if (typeof rawInput !== 'string') return '';
+  let text = rawInput.trim();
+  if (!text) return '';
+
+  while (/^\s*<style\b[^>]*>[\s\S]*<\/style>\s*$/i.test(text)) {
+    text = text
+      .replace(/^\s*<style\b[^>]*>/i, '')
+      .replace(/<\/style>\s*$/i, '')
+      .trim();
+  }
+
+  if (/<\/?style\b[^>]*>/i.test(text)) {
+    text = text.replace(/<\/?style\b[^>]*>/gi, '').trim();
+  }
+
+  return text;
+}
+
+let activeHeaderCssProvider: (() => { currentCss: string; isCustomized: boolean }) | null = null;
+
+export function registerFourthwallHeaderCssProvider(
+  provider: () => { currentCss: string; isCustomized: boolean }
+): void {
+  activeHeaderCssProvider = provider;
+}
+
+export function getEffectiveFourthwallHeaderCss(): string {
+  if (activeHeaderCssProvider) {
+    const state = activeHeaderCssProvider();
+    if (state && typeof state.currentCss === 'string' && state.currentCss.trim()) {
+      return normalizeHeaderCssInput(state.currentCss);
+    }
+  }
+  return DEFAULT_GIFT_GUIDE_CSS;
+}
+
+/**
  * Resolves the active stylesheet for a project, defaulting to the existing Fourthwall `.sog-*` CSS
  * when no custom CSS has been saved yet.
  */
@@ -3900,14 +3972,7 @@ export function updateProjectCss(
 ): HtmlEditorProject {
   const normalized = ensureProjectHasSections(project, catalogProducts);
   const nowIso = new Date().toISOString();
-  const cleanCss =
-    typeof newCss === 'string'
-      ? newCss
-          .trim()
-          .replace(/^<style[^>]*>/i, '')
-          .replace(/<\/style>$/i, '')
-          .trim()
-      : '';
+  const cleanCss = typeof newCss === 'string' ? normalizeHeaderCssInput(newCss) : '';
   return {
     ...normalized,
     customCss: cleanCss,
@@ -3922,6 +3987,7 @@ export function updateProjectCss(
 /**
  * Strips any leading `<style>` wrapper previously generated for export so CSS is never duplicated,
  * and combines the active CSS (`<style>...</style>`) and HTML for Fourthwall export.
+ * Never injects the global Fourthwall Header CSS reference unless explicitly passed as `cssContent`.
  */
 export function buildFourthwallExportCode(
   htmlContent: string,
@@ -3934,7 +4000,7 @@ export function buildFourthwallExportCode(
     return cleanHtml;
   }
   const resolvedCss =
-    typeof cssContent === 'string' ? cssContent.trim() : DEFAULT_GIFT_GUIDE_CSS;
+    typeof cssContent === 'string' ? normalizeHeaderCssInput(cssContent) : DEFAULT_GIFT_GUIDE_CSS;
   if (!resolvedCss) {
     return cleanHtml;
   }
@@ -3942,22 +4008,55 @@ export function buildFourthwallExportCode(
 }
 
 /**
- * Builds the complete HTML document injected into the isolated Live Preview iframe,
- * using the exact current CSS that will be exported to Fourthwall.
+ * Builds the complete HTML document injected into the isolated Live Preview iframe.
+ * Injects the active Fourthwall Header CSS (Live Preview Reference) and any custom guide-specific
+ * CSS while preventing stale or duplicated stylesheets from remaining in the preview iframe.
  */
 export function buildPreviewIframeDocument(
   safePreviewBodyHtml: string,
   cssContent?: string,
-  includeCss = true
+  includeCss = true,
+  headerCssOverride?: string
 ): string {
-  const resolvedCss =
-    typeof cssContent === 'string' ? cssContent : DEFAULT_GIFT_GUIDE_CSS;
+  const providerState = activeHeaderCssProvider ? activeHeaderCssProvider() : null;
+  const hasExplicitHeaderOverride =
+    typeof headerCssOverride === 'string' && headerCssOverride.trim().length > 0;
+  const isGlobalHeaderCustomized = Boolean(providerState?.isCustomized);
+  const resolvedHeaderCss = normalizeHeaderCssInput(
+    hasExplicitHeaderOverride
+      ? headerCssOverride!
+      : providerState?.currentCss || DEFAULT_GIFT_GUIDE_CSS
+  );
+
+  const hasExplicitCssArg = typeof cssContent === 'string';
+  const cleanedGuideCss = hasExplicitCssArg ? normalizeHeaderCssInput(cssContent) : '';
+  const isGuideCssDefault =
+    !hasExplicitCssArg ||
+    cleanedGuideCss === DEFAULT_GIFT_GUIDE_CSS ||
+    cleanedGuideCss === LOCKED_FOURTHWALL_CSS.trim();
+
+  let styleBlocksHtml = '';
+  if (includeCss) {
+    if (hasExplicitHeaderOverride || isGlobalHeaderCustomized) {
+      if (resolvedHeaderCss) {
+        styleBlocksHtml += `\n  <style id="sog-fourthwall-header-css">\n${resolvedHeaderCss}\n  </style>`;
+      }
+      if (cleanedGuideCss && !isGuideCssDefault && cleanedGuideCss !== resolvedHeaderCss) {
+        styleBlocksHtml += `\n  <style id="sog-gift-guide-css">\n${cleanedGuideCss}\n  </style>`;
+      }
+    } else if (!isGuideCssDefault && cleanedGuideCss) {
+      styleBlocksHtml = `\n  <style id="sog-gift-guide-css">\n${cleanedGuideCss}\n  </style>`;
+    } else if (resolvedHeaderCss) {
+      styleBlocksHtml = `\n  <style id="sog-fourthwall-header-css">\n${resolvedHeaderCss}\n  </style>`;
+    }
+  }
+
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
+  <style id="sog-preview-base-reset">
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       color: #111;
@@ -3972,8 +4071,7 @@ export function buildPreviewIframeDocument(
       opacity: 1 !important;
       visibility: visible !important;
     }
-    ${includeCss ? resolvedCss : ''}
-  </style>
+  </style>${styleBlocksHtml}
 </head>
 <body>
 ${safePreviewBodyHtml}
@@ -4572,12 +4670,13 @@ export function exportProjectSectionHtml(
         { includeCss: true }
       )
     : target.htmlContent;
-  return evaluateHtmlExportSize(output);
+  return evaluateHtmlExportSize(output, { scope: 'section' });
 }
 
 /**
- * Exports the complete project HTML (including its active CSS stylesheet and all sections in displayed order)
- * along with its total character count and Fourthwall 30,000-character limit status.
+ * Exports the complete project HTML (including its active guide-specific CSS stylesheet if requested
+ * and all sections in displayed order) along with its neutral total character count.
+ * Never automatically inserts the global Fourthwall Header CSS reference into exported HTML.
  */
 export function exportCompleteProjectHtml(
   project: HtmlEditorProject,
@@ -4586,15 +4685,19 @@ export function exportCompleteProjectHtml(
 ): HtmlExportPayload {
   const normalized = ensureProjectHasSections(project, catalogProducts);
   const fullHtml = joinProjectSectionsHtml(normalized.sections || []);
+  const activeCss = options?.customCss ?? resolveProjectCss(normalized);
+  const hasCustomGuideCss =
+    typeof activeCss === 'string' &&
+    activeCss.trim().length > 0 &&
+    normalizeHeaderCssInput(activeCss) !== DEFAULT_GIFT_GUIDE_CSS;
   const shouldIncludeCss =
     options?.includeCss !== undefined
       ? options.includeCss
-      : normalized.editorState?.includeFourthwallCss !== false;
-  const activeCss = options?.customCss ?? resolveProjectCss(normalized);
+      : hasCustomGuideCss && normalized.editorState?.includeFourthwallCss !== false;
   const combinedCode = buildFourthwallExportCode(fullHtml, activeCss, {
     includeCss: shouldIncludeCss,
   });
-  return evaluateHtmlExportSize(combinedCode);
+  return evaluateHtmlExportSize(combinedCode, { scope: 'complete_project' });
 }
 
 

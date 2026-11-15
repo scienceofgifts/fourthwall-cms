@@ -1,9 +1,20 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Copy, Check, Download, Code, Eye, Monitor, Smartphone, Tablet } from 'lucide-react';
-import { GuideSection, Product } from '../types/cms';
+import { FourthwallHeaderCssSetting, GuideSection, Product } from '../types/cms';
 import { renderFullGuideHtml, renderSectionHtml } from '../services/htmlRenderer';
-import { getActiveLocalHtmlProjectId, loadLocalHtmlProjects } from '../services/firebase';
-import { buildFourthwallExportCode, resolveProjectCss } from '../services/htmlWorkspaceEngine';
+import {
+  FOURTHWALL_HEADER_CSS_UPDATED_EVENT,
+  getActiveLocalHtmlProjectId,
+  getFourthwallHeaderCssSync,
+  loadFourthwallHeaderCssAsync,
+  loadLocalHtmlProjects,
+} from '../services/firebase';
+import {
+  buildFourthwallExportCode,
+  buildPreviewIframeDocument,
+  DEFAULT_GIFT_GUIDE_CSS,
+  resolveProjectCss,
+} from '../services/htmlWorkspaceEngine';
 
 interface LivePreviewPanelProps {
   sections: GuideSection[];
@@ -24,6 +35,28 @@ export const LivePreviewPanel: React.FC<LivePreviewPanelProps> = ({
   const [viewTab, setViewTab] = useState<'visual' | 'html'>('visual');
   const [viewportWidth, setViewportWidth] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+  const [fourthwallHeaderCss, setFourthwallHeaderCss] = useState<string>(
+    () => getFourthwallHeaderCssSync().currentCss
+  );
+
+  useEffect(() => {
+    let active = true;
+    void loadFourthwallHeaderCssAsync()
+      .then((setting) => {
+        if (active) setFourthwallHeaderCss(setting.currentCss);
+      })
+      .catch(() => {});
+    const onHeaderUpdated = (event: Event) => {
+      const evt = event as CustomEvent<FourthwallHeaderCssSetting>;
+      const next = evt.detail || getFourthwallHeaderCssSync();
+      setFourthwallHeaderCss(next.currentCss);
+    };
+    window.addEventListener(FOURTHWALL_HEADER_CSS_UPDATED_EVENT, onHeaderUpdated);
+    return () => {
+      active = false;
+      window.removeEventListener(FOURTHWALL_HEADER_CSS_UPDATED_EVENT, onHeaderUpdated);
+    };
+  }, []);
 
   const activeCss = useMemo(() => {
     if (typeof customCss === 'string' && customCss.trim().length > 0) {
@@ -34,6 +67,9 @@ export const LivePreviewPanel: React.FC<LivePreviewPanelProps> = ({
     const activeProj = projects.find((p) => p.id === activeId) || projects[0] || null;
     return resolveProjectCss(activeProj);
   }, [customCss]);
+
+  const hasCustomGuideCss =
+    activeCss.trim().length > 0 && activeCss.trim() !== DEFAULT_GIFT_GUIDE_CSS.trim();
 
   const activeSection = useMemo(
     () => sections.find((s) => s.id === activeSectionId) || sections[0] || null,
@@ -49,42 +85,21 @@ export const LivePreviewPanel: React.FC<LivePreviewPanelProps> = ({
     return renderFullGuideHtml(sections, products, { forPreview: true });
   }, [previewScope, activeSection, sections, products]);
 
-  // Exact exported HTML for Fourthwall custom-code block
+  // Exact exported HTML for Fourthwall custom-code block (never injects Fourthwall Header CSS)
   const exportHtml = useMemo(() => {
     if (previewScope === 'section') {
       if (!activeSection) return '';
       const rawSec = renderSectionHtml(activeSection, products, { forPreview: false });
-      return buildFourthwallExportCode(rawSec, activeCss, { includeCss: true });
+      return buildFourthwallExportCode(rawSec, activeCss, { includeCss: hasCustomGuideCss });
     }
     const rawFull = renderFullGuideHtml(sections, products, { forPreview: false });
-    return buildFourthwallExportCode(rawFull, activeCss, { includeCss: true });
-  }, [previewScope, activeSection, sections, products, activeCss]);
+    return buildFourthwallExportCode(rawFull, activeCss, { includeCss: hasCustomGuideCss });
+  }, [previewScope, activeSection, sections, products, activeCss, hasCustomGuideCss]);
 
-  // Complete srcDoc for the isolated iframe preview so Fourthwall responsive breakpoints (@media) work accurately
+  // Complete srcDoc for the isolated iframe preview so Fourthwall Header CSS and responsive breakpoints work accurately
   const iframeSrcDoc = useMemo(() => {
-    return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <style>
-    body {
-      margin: 0;
-      padding: 20px 24px 60px 24px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      color: #111;
-      background: #ffffff;
-      line-height: 1.5;
-    }
-    * { box-sizing: border-box; }
-    ${activeCss}
-  </style>
-</head>
-<body>
-  ${visualHtml}
-</body>
-</html>`;
-  }, [visualHtml, activeCss]);
+    return buildPreviewIframeDocument(visualHtml, activeCss, true, fourthwallHeaderCss);
+  }, [visualHtml, activeCss, fourthwallHeaderCss]);
 
   const handleCopyExportHtml = async () => {
     if (!exportHtml) return;

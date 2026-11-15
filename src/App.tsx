@@ -31,6 +31,7 @@ import {
   ensureUserSettings,
   fetchGuideWithSections,
   loadLocalCatalogProducts,
+  loadLocalCatalogProductsAsync,
   onAuthStateChanged,
   restoreProjectBackupToFirestore,
   saveCompleteGuideProject,
@@ -65,8 +66,8 @@ import {
 import { ProductLibraryView } from './components/ProductLibraryView';
 import { HtmlEditorWorkspace } from './components/HtmlEditorWorkspace';
 import { ExportAndSchemaView } from './components/ExportAndSchemaView';
+import { FourthwallHeaderCssEditor } from './components/FourthwallHeaderCssEditor';
 import { renderFullGuideHtml } from './services/htmlRenderer';
-import { LOCKED_FOURTHWALL_CSS } from './constants/lockedCss';
 import firebaseConfig from '../firebase-applet-config.json';
 
 type NavView = 'products' | 'html_editor' | 'export_schema' | 'settings';
@@ -121,7 +122,20 @@ export default function App() {
     return () => window.removeEventListener(GEMINI_MODEL_CHANGED_EVENT, syncModel);
   }, []);
 
-  // Persist catalog in localStorage whenever products change so reloads preserve local work
+  // Hydrate catalog products from IndexedDB (and migrate legacy localStorage catalog if present)
+  useEffect(() => {
+    let mounted = true;
+    void loadLocalCatalogProductsAsync().then((hydrated) => {
+      if (mounted && hydrated && hydrated.length > 0) {
+        setProducts(hydrated);
+      }
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Persist catalog in IndexedDB whenever products change so reloads preserve local work
   useEffect(() => {
     if (products.length > 0) {
       saveLocalCatalogProducts(products);
@@ -153,6 +167,11 @@ export default function App() {
       setGuides([localGuide]);
       setActiveGuide(localGuide);
       setActiveSections(localSecs);
+      void loadLocalCatalogProductsAsync().then((hydrated) => {
+        if (hydrated && hydrated.length > 0) {
+          setProducts(hydrated);
+        }
+      });
     };
 
     const unsub = onAuthStateChanged(auth, async (currUser) => {
@@ -815,20 +834,8 @@ export default function App() {
             </div>
           )}
 
-          {/* Locked Fourthwall Header CSS Reference */}
-          <div className="bg-white border border-[#DED8CA] rounded-xl p-6 space-y-3 shadow-2xs">
-            <h2 className="text-base font-editorial font-semibold text-[#111A27]">
-              Locked Fourthwall Header CSS Contract (Read-Only Reference)
-            </h2>
-            <p className="text-[#3E4C5E]">
-              This stylesheet is installed in your Fourthwall site header. The HTML Editor uses it
-              exclusively inside the isolated Live Preview iframe and never injects it into your
-              exported HTML output.
-            </p>
-            <pre className="p-4 bg-[#111926] text-[#E6EEF8] rounded-xl font-mono-tabular text-[11px] overflow-x-auto max-h-64 leading-relaxed">
-              {`<style>${LOCKED_FOURTHWALL_CSS}</style>`}
-            </pre>
-          </div>
+          {/* Fourthwall Header CSS (Live Preview Reference) */}
+          <FourthwallHeaderCssEditor userId={user?.uid} onShowToast={showToast} />
         </div>
       )}
     </div>

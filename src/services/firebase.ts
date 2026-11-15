@@ -26,6 +26,7 @@ import {
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import {
+  FourthwallHeaderCssSetting,
   GiftGuide,
   GuideSection,
   HtmlEditorProject,
@@ -350,26 +351,23 @@ export function unpackProductFromFirestoreDoc(
 const LOCAL_PRODUCTS_STORAGE_KEY = 'sog_catalog_products_v2';
 
 export function loadLocalCatalogProducts(): Product[] | null {
-  if (typeof window === 'undefined' || !window.localStorage) return null;
-  try {
-    const raw = window.localStorage.getItem(LOCAL_PRODUCTS_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return null;
-    const managedCats = loadManagedCategories();
-    return (parsed as Product[]).map((p) => migrateAndHydrateProductRecord(p, managedCats));
-  } catch {
-    return null;
-  }
+  const cached = getCachedCatalogProductsSync();
+  if (!cached) return null;
+  const managedCats = loadManagedCategories();
+  return cached.map((p) => migrateAndHydrateProductRecord(p, managedCats));
+}
+
+export async function loadLocalCatalogProductsAsync(): Promise<Product[] | null> {
+  const hydrated = await hydrateCatalogProductsFromIdb();
+  if (!hydrated) return null;
+  const managedCats = loadManagedCategories();
+  return hydrated.map((p) => migrateAndHydrateProductRecord(p, managedCats));
 }
 
 export function saveLocalCatalogProducts(products: Product[]): void {
-  if (typeof window === 'undefined' || !window.localStorage) return;
-  try {
-    window.localStorage.setItem(LOCAL_PRODUCTS_STORAGE_KEY, JSON.stringify(products));
-  } catch {
-    // Ignore storage quota errors
-  }
+  void saveCatalogProductsToIdb(products).catch(() => {
+    // Best-effort background catalog cache persistence
+  });
 }
 
 /**
@@ -1016,20 +1014,67 @@ export async function restoreProjectBackupToFirestore(
 }
 
 // ============================================================================
-// PERSISTENT HTML EDITOR PROJECTS (LOCAL STORAGE + CLOUD FIRESTORE)
+// PERSISTENT HTML EDITOR PROJECTS (INDEXEDDB + CLOUD FIRESTORE)
 // ============================================================================
 
-export const LOCAL_HTML_PROJECTS_STORAGE_KEY = 'sog_html_projects_v1';
-export const LOCAL_ACTIVE_HTML_PROJECT_ID_KEY = 'sog_html_active_project_id_v1';
-export const MAX_SINGLE_HTML_FIELD_CHARS = 400_000;
-export const MAX_TOTAL_LOCAL_STORAGE_CHARS = 4_200_000;
+import {
+  DEFAULT_HTML_EDITOR_STATE,
+  FOURTHWALL_HEADER_CSS_UPDATED_EVENT,
+  GLOBAL_FOURTHWALL_HEADER_CSS_KEY,
+  LEGACY_LOCAL_HTML_PROJECTS_KEY,
+  LOCAL_ACTIVE_HTML_PROJECT_ID_KEY,
+  LOCAL_HTML_PROJECTS_MIGRATED_KEY,
+  MAX_SINGLE_HTML_FIELD_CHARS,
+  StorageDiagnosticError,
+  classifyStorageFailure,
+  createMockIndexedDbFactory,
+  getActiveHtmlProjectIdAsync,
+  getActiveLocalHtmlProjectId as getActiveLocalHtmlProjectIdFromIdb,
+  getCachedCatalogProductsSync,
+  getCachedFourthwallHeaderCssSync,
+  getCachedHtmlProjectsSync,
+  getDefaultFourthwallHeaderCssSetting,
+  hydrateCatalogProductsFromIdb,
+  hydrateFourthwallHeaderCssFromIdb,
+  hydrateHtmlProjectsFromIdb,
+  migrateLocalStorageProjectsToIdb,
+  normalizeEditorState,
+  removeHtmlProjectFromIdb,
+  restorePreviousFourthwallHeaderCssInIdb,
+  saveCatalogProductsToIdb,
+  saveFourthwallHeaderCssToIdb,
+  saveHtmlProjectToIdb,
+  saveHtmlProjectsBatchToIdb,
+  setActiveLocalHtmlProjectId as setActiveLocalHtmlProjectIdInIdb,
+  setSimulatedIdbFailureForTesting,
+  simulateBrowserReloadForTesting,
+} from './projectStorageIdb';
 
-export const DEFAULT_HTML_EDITOR_STATE: HtmlProjectEditorState = {
-  viewMode: 'split',
-  selectedBlockId: 'ALL',
-  previewViewport: 'desktop',
-  includeFourthwallCss: true,
-  customCss: DEFAULT_GIFT_GUIDE_CSS,
+export const LOCAL_HTML_PROJECTS_STORAGE_KEY = LEGACY_LOCAL_HTML_PROJECTS_KEY;
+export const FIRESTORE_GLOBAL_HEADER_CSS_DOC_ID = 'sog-global-fourthwall-header-css';
+export {
+  DEFAULT_HTML_EDITOR_STATE,
+  FOURTHWALL_HEADER_CSS_UPDATED_EVENT,
+  GLOBAL_FOURTHWALL_HEADER_CSS_KEY,
+  LOCAL_ACTIVE_HTML_PROJECT_ID_KEY,
+  LOCAL_HTML_PROJECTS_MIGRATED_KEY,
+  MAX_SINGLE_HTML_FIELD_CHARS,
+  StorageDiagnosticError,
+  classifyStorageFailure,
+  createMockIndexedDbFactory,
+  getActiveHtmlProjectIdAsync,
+  getCachedCatalogProductsSync,
+  getCachedFourthwallHeaderCssSync,
+  getDefaultFourthwallHeaderCssSetting,
+  hydrateCatalogProductsFromIdb,
+  hydrateFourthwallHeaderCssFromIdb,
+  hydrateHtmlProjectsFromIdb,
+  migrateLocalStorageProjectsToIdb,
+  restorePreviousFourthwallHeaderCssInIdb,
+  saveCatalogProductsToIdb,
+  saveFourthwallHeaderCssToIdb,
+  setSimulatedIdbFailureForTesting,
+  simulateBrowserReloadForTesting,
 };
 
 export function validateHtmlProjectForSave(
@@ -1048,20 +1093,8 @@ export function validateHtmlProjectForSave(
   if (typeof project.currentHtml !== 'string') {
     return { valid: false, error: 'Current HTML content must be a string.' };
   }
-  if (project.currentHtml.length > MAX_SINGLE_HTML_FIELD_CHARS) {
-    return {
-      valid: false,
-      error: `Edited HTML size (${Math.round(project.currentHtml.length / 1024)} KB) exceeds the safe 400 KB per-project storage limit.`,
-    };
-  }
   if (typeof project.originalHtml !== 'string') {
     return { valid: false, error: 'Original HTML content must be a string.' };
-  }
-  if (project.originalHtml.length > MAX_SINGLE_HTML_FIELD_CHARS) {
-    return {
-      valid: false,
-      error: `Original HTML size (${Math.round(project.originalHtml.length / 1024)} KB) exceeds the safe 400 KB per-project storage limit.`,
-    };
   }
   if ((project.baseUrl || '').length > 1000) {
     return { valid: false, error: 'Base URL exceeds maximum length (1000 characters).' };
@@ -1069,288 +1102,288 @@ export function validateHtmlProjectForSave(
   return { valid: true };
 }
 
-const ALLOWED_SECTION_CATEGORIES = new Set<HtmlSectionCategory>([
-  'toc',
-  'quick_picks',
-  'editors_pick',
-  'editorial_list',
-  'product_grid',
-  'single_product_card',
-  'category_hub',
-  'buying_guide',
-  'faq_section',
-  'related_guides',
-  'content_section',
-  'raw_fallback',
-]);
-
-function sanitizeProjectSections(rawSections?: unknown): HtmlProjectSection[] | undefined {
-  if (!Array.isArray(rawSections)) return undefined;
-  const nowIso = new Date().toISOString();
-  const result: HtmlProjectSection[] = [];
-  for (let i = 0; i < Math.min(rawSections.length, 150); i++) {
-    const item = rawSections[i];
-    if (!item || typeof item !== 'object') continue;
-    const rec = item as Partial<HtmlProjectSection>;
-    if (typeof rec.htmlContent !== 'string') continue;
-    const cleanId =
-      typeof rec.id === 'string' && rec.id.trim() ? rec.id.trim().slice(0, 120) : `sec-${i + 1}`;
-    const cleanName =
-      typeof rec.name === 'string' && rec.name.trim()
-        ? rec.name.trim().slice(0, 200)
-        : `Section ${i + 1}`;
-    const cleanType: HtmlSectionCategory =
-      typeof rec.type === 'string' && ALLOWED_SECTION_CATEGORIES.has(rec.type as HtmlSectionCategory)
-        ? (rec.type as HtmlSectionCategory)
-        : 'content_section';
-    const cleanManualType: HtmlSectionCategory | undefined =
-      typeof rec.manualType === 'string' &&
-      ALLOWED_SECTION_CATEGORIES.has(rec.manualType as HtmlSectionCategory)
-        ? (rec.manualType as HtmlSectionCategory)
-        : undefined;
-    const cleanStartNum =
-      typeof rec.startingProductNumber === 'number' &&
-      Number.isInteger(rec.startingProductNumber) &&
-      rec.startingProductNumber >= 1
-        ? rec.startingProductNumber
-        : undefined;
-
-    const sectionRecord: HtmlProjectSection = {
-      id: cleanId,
-      name: cleanName,
-      order: i,
-      htmlContent: rec.htmlContent.slice(0, MAX_SINGLE_HTML_FIELD_CHARS),
-      originalHtml:
-        typeof rec.originalHtml === 'string'
-          ? rec.originalHtml.slice(0, MAX_SINGLE_HTML_FIELD_CHARS)
-          : rec.htmlContent.slice(0, MAX_SINGLE_HTML_FIELD_CHARS),
-      type: cleanManualType || cleanType,
-      ...(cleanManualType ? { manualType: cleanManualType } : {}),
-      ...(cleanStartNum !== undefined ? { startingProductNumber: cleanStartNum } : {}),
-      createdAt: typeof rec.createdAt === 'string' && rec.createdAt ? rec.createdAt : nowIso,
-      updatedAt: typeof rec.updatedAt === 'string' && rec.updatedAt ? rec.updatedAt : nowIso,
-    };
-    result.push(sectionRecord);
-  }
-  return result;
-}
-
-function normalizeEditorState(
-  raw?: Partial<HtmlProjectEditorState>,
-  fallbackSections?: HtmlProjectSection[],
-  fallbackCustomCss?: string
-): HtmlProjectEditorState {
-  const sanitizedStartingNumbers: Record<string, number> = {};
-  if (raw?.sectionStartingNumbers && typeof raw.sectionStartingNumbers === 'object') {
-    const entries = Object.entries(raw.sectionStartingNumbers).slice(0, 100);
-    for (const [key, val] of entries) {
-      if (typeof key === 'string' && key.trim() && typeof val === 'number' && Number.isInteger(val) && val >= 1) {
-        sanitizedStartingNumbers[key.trim().slice(0, 160)] = val;
-      }
-    }
-  }
-
-  const sanitizedSections = sanitizeProjectSections(raw?.sections ?? fallbackSections);
-  const rawCss =
-    typeof raw?.customCss === 'string'
-      ? raw.customCss
-      : typeof fallbackCustomCss === 'string'
-      ? fallbackCustomCss
-      : DEFAULT_GIFT_GUIDE_CSS;
-  const sanitizedCss = rawCss.slice(0, MAX_SINGLE_HTML_FIELD_CHARS);
-
-  return {
-    viewMode:
-      raw?.viewMode === 'split' ||
-      raw?.viewMode === 'visual' ||
-      raw?.viewMode === 'raw' ||
-      raw?.viewMode === 'css' ||
-      raw?.viewMode === 'preview'
-        ? raw.viewMode
-        : 'split',
-    selectedBlockId: typeof raw?.selectedBlockId === 'string' && raw.selectedBlockId ? raw.selectedBlockId : 'ALL',
-    sidebarTab: raw?.sidebarTab === 'anchors' ? 'anchors' : 'blocks',
-    previewViewport: raw?.previewViewport === 'mobile' ? 'mobile' : 'desktop',
-    includeFourthwallCss: raw?.includeFourthwallCss !== false,
-    customCss: sanitizedCss,
-    ...(Object.keys(sanitizedStartingNumbers).length > 0
-      ? { sectionStartingNumbers: sanitizedStartingNumbers }
-      : {}),
-    ...(sanitizedSections !== undefined ? { sections: sanitizedSections } : {}),
-  };
-}
-
+/**
+ * Synchronous project list reader backed by IndexedDB cache (and automatic one-time migration
+ * if legacy `localStorage` project data is detected).
+ */
 export function loadLocalHtmlProjects(): HtmlEditorProject[] {
-  if (typeof window === 'undefined' || !window.localStorage) return [];
-  try {
-    const raw = window.localStorage.getItem(LOCAL_HTML_PROJECTS_STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        return parsed
-          .filter(
-            (item) =>
-              item &&
-              typeof item === 'object' &&
-              typeof item.id === 'string' &&
-              typeof item.name === 'string' &&
-              typeof item.currentHtml === 'string'
-          )
-          .map((item) => {
-            const normalizedEditorState = normalizeEditorState(
-              item.editorState,
-              item.sections,
-              typeof item.customCss === 'string' ? item.customCss : undefined
-            );
-            return ensureProjectHasSections({
-              id: item.id,
-              ownerId: typeof item.ownerId === 'string' ? item.ownerId : 'local-preview',
-              name: item.name,
-              currentHtml: item.currentHtml,
-              originalHtml:
-                typeof item.originalHtml === 'string' ? item.originalHtml : item.currentHtml,
-              baseUrl:
-                typeof item.baseUrl === 'string' ? item.baseUrl : 'https://scienceofgifts.com',
-              customCss: normalizedEditorState.customCss,
-              sections: normalizedEditorState.sections,
-              editorState: normalizedEditorState,
-              createdAt:
-                typeof item.createdAt === 'string' ? item.createdAt : new Date().toISOString(),
-              updatedAt:
-                typeof item.updatedAt === 'string' ? item.updatedAt : new Date().toISOString(),
-            });
-          })
-          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      }
-    }
-
-    // Migrate legacy single-session HTML if present
-    const legacySessionRaw = window.localStorage.getItem('sog_html_workspace_session_v2');
-    const legacyCurrent = window.localStorage.getItem('sog_html_workspace_v2_current');
-    const legacyOriginal = window.localStorage.getItem('sog_html_workspace_v2_original');
-
-    let migratedCurrent = '';
-    let migratedOriginal = '';
-    if (legacyCurrent && legacyCurrent.trim()) {
-      migratedCurrent = legacyCurrent;
-      migratedOriginal = legacyOriginal && legacyOriginal.trim() ? legacyOriginal : legacyCurrent;
-    } else if (legacySessionRaw) {
-      const parsedSession = JSON.parse(legacySessionRaw);
-      if (typeof parsedSession?.currentHtml === 'string' && parsedSession.currentHtml.trim()) {
-        migratedCurrent = parsedSession.currentHtml;
-        migratedOriginal =
-          typeof parsedSession?.originalHtml === 'string' && parsedSession.originalHtml.trim()
-            ? parsedSession.originalHtml
-            : parsedSession.currentHtml;
-      }
-    }
-
-    if (migratedCurrent) {
-      const nowIso = new Date().toISOString();
-      const migratedProject = ensureProjectHasSections({
-        id: 'proj-greek-mythology-default',
-        ownerId: 'local-preview',
-        name: 'Greek Mythology Gift Guide',
-        currentHtml: migratedCurrent,
-        originalHtml: migratedOriginal,
-        baseUrl: 'https://scienceofgifts.com',
-        editorState: { ...DEFAULT_HTML_EDITOR_STATE },
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      });
-      saveLocalHtmlProjectsList([migratedProject]);
-      setActiveLocalHtmlProjectId(migratedProject.id);
-      return [migratedProject];
-    }
-  } catch {
-    return [];
-  }
-  return [];
-}
-
-export function getActiveLocalHtmlProjectId(): string | null {
-  if (typeof window === 'undefined' || !window.localStorage) return null;
-  try {
-    return window.localStorage.getItem(LOCAL_ACTIVE_HTML_PROJECT_ID_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function setActiveLocalHtmlProjectId(projectId: string): void {
-  if (typeof window === 'undefined' || !window.localStorage) return;
-  try {
-    window.localStorage.setItem(LOCAL_ACTIVE_HTML_PROJECT_ID_KEY, projectId);
-  } catch {
-    // Ignore active ID pointer failure if storage is locked
-  }
+  return getCachedHtmlProjectsSync();
 }
 
 /**
- * Writes the complete list of HTML projects to localStorage with strict size and error checks.
- * Never swallows errors silently—throws an actionable Error if quota is exceeded or storage fails.
+ * Asynchronous project list loader that ensures IndexedDB and any one-time `localStorage` migration
+ * have completed before returning all stored HTML projects.
  */
-export function saveLocalHtmlProjectsList(projects: HtmlEditorProject[]): void {
-  if (typeof window === 'undefined' || !window.localStorage) {
-    throw new Error('Browser localStorage is unavailable in this environment.');
-  }
-  const serialized = JSON.stringify(projects);
-  if (serialized.length > MAX_TOTAL_LOCAL_STORAGE_CHARS) {
-    throw new Error(
-      `Total project storage (${Math.round(serialized.length / 1024)} KB) exceeds safe browser storage capacity (~4.1 MB). Delete unused projects before saving.`
-    );
-  }
-  try {
-    window.localStorage.setItem(LOCAL_HTML_PROJECTS_STORAGE_KEY, serialized);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to persist project to browser storage: ${msg}`);
-  }
+export async function loadHtmlProjectsAsync(): Promise<HtmlEditorProject[]> {
+  return hydrateHtmlProjectsFromIdb();
 }
 
-function sanitizeHtmlProjectFirestorePayload(userId: string, project: HtmlEditorProject) {
-  return {
-    ownerId: userId,
-    name: (project.name || 'Untitled Project').trim().slice(0, 300),
-    currentHtml: (project.currentHtml || '').slice(0, MAX_SINGLE_HTML_FIELD_CHARS),
-    originalHtml: (project.originalHtml || '').slice(0, MAX_SINGLE_HTML_FIELD_CHARS),
-    baseUrl: (project.baseUrl || 'https://scienceofgifts.com').trim().slice(0, 1000),
-    editorState: normalizeEditorState(
-      project.editorState,
-      project.sections,
-      project.customCss ?? project.editorState?.customCss
-    ),
+export const loadLocalHtmlProjectsAsync = loadHtmlProjectsAsync;
+
+export function getActiveLocalHtmlProjectId(): string | null {
+  return getActiveLocalHtmlProjectIdFromIdb();
+}
+
+export function setActiveLocalHtmlProjectId(projectId: string): void {
+  setActiveLocalHtmlProjectIdInIdb(projectId);
+}
+
+/**
+ * Syncs a batch of HTML projects into IndexedDB without storing project HTML in `localStorage`.
+ * Returns a Promise so callers can await completion and handle any storage failure explicitly.
+ */
+export async function saveLocalHtmlProjectsList(
+  projects: HtmlEditorProject[]
+): Promise<HtmlEditorProject[]> {
+  return saveHtmlProjectsBatchToIdb(projects);
+}
+
+const FIRESTORE_SINGLE_DOC_MAX_FIELD_CHARS = 320_000;
+const FIRESTORE_SINGLE_DOC_MAX_TOTAL_BYTES = 750_000;
+const FIRESTORE_CHUNK_SLICE_CHARS = 240_000;
+const FIRESTORE_PARENT_PREVIEW_CHARS = 80_000;
+
+export interface FirestoreHtmlProjectPayloadPlan {
+  isChunked: boolean;
+  parentId: string;
+  parentPayload: {
+    ownerId: string;
+    name: string;
+    currentHtml: string;
+    originalHtml: string;
+    baseUrl: string;
+    editorState: Record<string, unknown>;
   };
+  chunkDocs: Array<{
+    id: string;
+    payload: {
+      ownerId: string;
+      name: string;
+      currentHtml: string;
+      originalHtml: string;
+      baseUrl: string;
+      editorState: Record<string, unknown>;
+    };
+  }>;
+}
+
+interface ChunkedPayloadEnvelope {
+  currentHtml: string;
+  originalHtml: string;
+  customCss?: string;
+  sections?: HtmlProjectSection[];
+}
+
+function buildCompactSingleDocEditorState(state: HtmlProjectEditorState): Record<string, unknown> {
+  const compactSections = state.sections?.map((sec) => {
+    if (sec.originalHtml === sec.htmlContent) {
+      const { originalHtml: _omitted, ...rest } = sec;
+      return rest;
+    }
+    return sec;
+  });
+  return {
+    viewMode: state.viewMode,
+    selectedBlockId: state.selectedBlockId,
+    sidebarTab: state.sidebarTab,
+    previewViewport: state.previewViewport,
+    includeFourthwallCss: state.includeFourthwallCss,
+    ...(typeof state.customCss === 'string' ? { customCss: state.customCss } : {}),
+    ...(compactSections ? { sections: compactSections } : {}),
+    ...(state.sectionStartingNumbers
+      ? { sectionStartingNumbers: state.sectionStartingNumbers }
+      : {}),
+  };
+}
+
+/**
+ * Builds either a single Firestore document payload (for standard guides) or a backward-compatible
+ * parent + chunked part documents plan (for guides that exceed single-document Firestore / rules limits).
+ * Every generated document strictly adheres to `isValidHtmlProject(data)` in `firestore.rules`.
+ */
+export function buildFirestoreHtmlProjectPayloads(
+  userId: string,
+  project: HtmlEditorProject
+): FirestoreHtmlProjectPayloadPlan {
+  const cleanId = sanitizeId(project.id);
+  const cleanName = (project.name || 'Untitled Project').trim().slice(0, 300);
+  const cleanBaseUrl = (project.baseUrl || 'https://scienceofgifts.com').trim().slice(0, 1000);
+  const normalizedState = normalizeEditorState(
+    project.editorState,
+    project.sections,
+    project.customCss ?? project.editorState?.customCss
+  );
+
+  const currentHtml = project.currentHtml || '';
+  const originalHtml = project.originalHtml || '';
+  const compactState = buildCompactSingleDocEditorState(normalizedState);
+
+  const singleDocCandidate = {
+    ownerId: userId,
+    name: cleanName,
+    currentHtml,
+    originalHtml,
+    baseUrl: cleanBaseUrl,
+    editorState: compactState,
+  };
+
+  const candidateJsonBytes = JSON.stringify(singleDocCandidate).length;
+  const fitsSingleDoc =
+    currentHtml.length <= FIRESTORE_SINGLE_DOC_MAX_FIELD_CHARS &&
+    originalHtml.length <= FIRESTORE_SINGLE_DOC_MAX_FIELD_CHARS &&
+    candidateJsonBytes <= FIRESTORE_SINGLE_DOC_MAX_TOTAL_BYTES;
+
+  if (fitsSingleDoc) {
+    return {
+      isChunked: false,
+      parentId: cleanId,
+      parentPayload: singleDocCandidate,
+      chunkDocs: [],
+    };
+  }
+
+  const envelope: ChunkedPayloadEnvelope = {
+    currentHtml,
+    originalHtml,
+    customCss: normalizedState.customCss,
+    sections: normalizedState.sections,
+  };
+  const serializedEnvelope = JSON.stringify(envelope);
+  const slices: string[] = [];
+  for (let offset = 0; offset < serializedEnvelope.length; offset += FIRESTORE_CHUNK_SLICE_CHARS) {
+    slices.push(serializedEnvelope.slice(offset, offset + FIRESTORE_CHUNK_SLICE_CHARS));
+  }
+  if (slices.length === 0) {
+    slices.push('{}');
+  }
+
+  const totalParts = slices.length;
+  const basePrefix = cleanId.slice(0, 95);
+  const partIds = slices.map((_, idx) => `${basePrefix}--part-${idx}`);
+
+  const chunkDocs = slices.map((slice, idx) => ({
+    id: partIds[idx],
+    payload: {
+      ownerId: userId,
+      name: `[Chunk ${idx + 1}/${totalParts}] ${cleanName}`.slice(0, 300),
+      currentHtml: slice,
+      originalHtml: '',
+      baseUrl: cleanBaseUrl,
+      editorState: {
+        isChunkPart: true,
+        parentProjectId: cleanId,
+        partIndex: idx,
+        totalParts,
+      },
+    },
+  }));
+
+  // Parent editorState must have <= 15 keys per firestore.rules
+  const parentEditorState: Record<string, unknown> = {
+    viewMode: normalizedState.viewMode,
+    selectedBlockId: normalizedState.selectedBlockId,
+    sidebarTab: normalizedState.sidebarTab,
+    previewViewport: normalizedState.previewViewport,
+    includeFourthwallCss: normalizedState.includeFourthwallCss,
+    ...(normalizedState.sectionStartingNumbers
+      ? { sectionStartingNumbers: normalizedState.sectionStartingNumbers }
+      : {}),
+    isChunkedParent: true,
+    chunkTotalParts: totalParts,
+    chunkPartIds: partIds,
+  };
+
+  return {
+    isChunked: true,
+    parentId: cleanId,
+    parentPayload: {
+      ownerId: userId,
+      name: cleanName,
+      currentHtml: currentHtml.slice(0, FIRESTORE_PARENT_PREVIEW_CHARS),
+      originalHtml: originalHtml.slice(0, FIRESTORE_PARENT_PREVIEW_CHARS),
+      baseUrl: cleanBaseUrl,
+      editorState: parentEditorState,
+    },
+    chunkDocs,
+  };
+}
+
+async function upsertHtmlProjectDoc(
+  userId: string,
+  docId: string,
+  payload: FirestoreHtmlProjectPayloadPlan['parentPayload']
+): Promise<void> {
+  const ref = doc(db, 'users', userId, 'htmlProjects', docId);
+  const snap = await getDoc(ref);
+  if (snap.exists()) {
+    const { ownerId: _o, ...mutableFields } = payload;
+    await updateDoc(ref, {
+      ...mutableFields,
+      updatedAt: serverTimestamp(),
+    });
+  } else {
+    await setDoc(ref, {
+      ...payload,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
 }
 
 export async function saveHtmlProjectToFirestore(
   userId: string,
   project: HtmlEditorProject
 ): Promise<string> {
-  const cleanId = sanitizeId(project.id);
-  const path = `users/${userId}/htmlProjects/${cleanId}`;
-  const ref = doc(db, 'users', userId, 'htmlProjects', cleanId);
-  const base = sanitizeHtmlProjectFirestorePayload(userId, { ...project, id: cleanId });
+  const plan = buildFirestoreHtmlProjectPayloads(userId, project);
+  const path = `users/${userId}/htmlProjects/${plan.parentId}`;
 
   try {
-    const snap = await getDoc(ref);
-    if (snap.exists()) {
-      const { ownerId: _o, ...mutableFields } = base;
-      await updateDoc(ref, {
+    // Clean up any stale chunk documents if the project previously had more chunks
+    const parentRef = doc(db, 'users', userId, 'htmlProjects', plan.parentId);
+    const existingParentSnap = await getDoc(parentRef);
+    const oldPartIds: string[] = Array.isArray(
+      existingParentSnap.exists() ? existingParentSnap.data()?.editorState?.chunkPartIds : undefined
+    )
+      ? (existingParentSnap.data()?.editorState?.chunkPartIds as string[])
+      : [];
+
+    // Write chunk documents first so parent snapshot readers always find complete parts
+    const activePartIdSet = new Set<string>();
+    for (const chunkDoc of plan.chunkDocs) {
+      activePartIdSet.add(chunkDoc.id);
+      await upsertHtmlProjectDoc(userId, chunkDoc.id, chunkDoc.payload);
+    }
+
+    // Write parent document
+    if (existingParentSnap.exists()) {
+      const { ownerId: _o, ...mutableFields } = plan.parentPayload;
+      await updateDoc(parentRef, {
         ...mutableFields,
         updatedAt: serverTimestamp(),
       });
-      return cleanId;
+    } else {
+      await setDoc(parentRef, {
+        ...plan.parentPayload,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
     }
-    await setDoc(ref, {
-      ...base,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-    return cleanId;
+
+    // Remove any obsolete chunk documents from previous larger saves
+    for (const oldPartId of oldPartIds) {
+      if (typeof oldPartId === 'string' && !activePartIdSet.has(oldPartId)) {
+        try {
+          await deleteDoc(doc(db, 'users', userId, 'htmlProjects', oldPartId));
+        } catch {
+          // Best-effort cleanup of obsolete chunk part
+        }
+      }
+    }
+
+    return plan.parentId;
   } catch (error) {
     if (isOfflineOrTokenServiceError(error)) {
-      return cleanId;
+      throw error instanceof Error ? error : new Error(String(error));
     }
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -1363,7 +1396,19 @@ export async function deleteHtmlProjectFromFirestore(
   const cleanId = sanitizeId(projectId);
   const path = `users/${userId}/htmlProjects/${cleanId}`;
   try {
-    await deleteDoc(doc(db, 'users', userId, 'htmlProjects', cleanId));
+    const parentRef = doc(db, 'users', userId, 'htmlProjects', cleanId);
+    const snap = await getDoc(parentRef);
+    if (snap.exists()) {
+      const partIds = snap.data()?.editorState?.chunkPartIds;
+      if (Array.isArray(partIds)) {
+        for (const partId of partIds) {
+          if (typeof partId === 'string') {
+            await deleteDoc(doc(db, 'users', userId, 'htmlProjects', partId));
+          }
+        }
+      }
+    }
+    await deleteDoc(parentRef);
   } catch (error) {
     if (isOfflineOrTokenServiceError(error)) {
       return;
@@ -1389,6 +1434,168 @@ function timestampToIso(ts: unknown, fallbackIso: string): string {
   return fallbackIso;
 }
 
+/**
+ * Reassembles single-document and multi-document chunked HTML projects from raw Firestore documents.
+ * Filters out internal `--part-N` chunk documents so they never appear as standalone projects.
+ */
+export function reassembleFirestoreHtmlProjects(
+  rawDocs: Array<{ id: string; data: Record<string, any> }>,
+  userId: string
+): HtmlEditorProject[] {
+  const nowIso = new Date().toISOString();
+  const docById = new Map<string, Record<string, any>>();
+  const parentDocs: Array<{ id: string; data: Record<string, any> }> = [];
+
+  for (const item of rawDocs) {
+    docById.set(item.id, item.data);
+    const editorState = item.data?.editorState;
+    const isChunkPart =
+      Boolean(editorState && typeof editorState === 'object' && editorState.isChunkPart === true) ||
+      /--part-\d+$/.test(item.id);
+    const isGlobalHeaderCssDoc =
+      item.id === FIRESTORE_GLOBAL_HEADER_CSS_DOC_ID ||
+      item.id.startsWith(`${FIRESTORE_GLOBAL_HEADER_CSS_DOC_ID}--part-`) ||
+      Boolean(
+        editorState &&
+          typeof editorState === 'object' &&
+          editorState.isGlobalHeaderCssSetting === true
+      );
+    if (!isChunkPart && !isGlobalHeaderCssDoc) {
+      parentDocs.push(item);
+    }
+  }
+
+  const results: HtmlEditorProject[] = [];
+  for (const { id, data } of parentDocs) {
+    const rawState = (data.editorState || {}) as Record<string, any>;
+    let currentHtml = String(data.currentHtml || '');
+    let originalHtml = String(data.originalHtml ?? data.currentHtml ?? '');
+    let customCss: string | undefined =
+      typeof data.customCss === 'string'
+        ? data.customCss
+        : typeof rawState.customCss === 'string'
+        ? rawState.customCss
+        : undefined;
+    let sectionsFromChunks: HtmlProjectSection[] | undefined = undefined;
+
+    if (rawState.isChunkedParent === true && Array.isArray(rawState.chunkPartIds)) {
+      const partIds = rawState.chunkPartIds as string[];
+      const slices: string[] = [];
+      let allPartsPresent = partIds.length > 0;
+      for (const partId of partIds) {
+        const partDoc = docById.get(partId);
+        if (!partDoc || typeof partDoc.currentHtml !== 'string') {
+          allPartsPresent = false;
+          break;
+        }
+        slices.push(partDoc.currentHtml);
+      }
+
+      if (allPartsPresent) {
+        try {
+          const parsedEnvelope = JSON.parse(slices.join('')) as ChunkedPayloadEnvelope;
+          if (typeof parsedEnvelope.currentHtml === 'string') {
+            currentHtml = parsedEnvelope.currentHtml;
+          }
+          if (typeof parsedEnvelope.originalHtml === 'string') {
+            originalHtml = parsedEnvelope.originalHtml;
+          }
+          if (typeof parsedEnvelope.customCss === 'string') {
+            customCss = parsedEnvelope.customCss;
+          }
+          if (Array.isArray(parsedEnvelope.sections)) {
+            sectionsFromChunks = parsedEnvelope.sections;
+          }
+        } catch {
+          // Fall back to parent preview fields if chunk JSON envelope is malformed
+        }
+      }
+    }
+
+    const rawSections = sectionsFromChunks ?? (Array.isArray(rawState.sections) ? rawState.sections : undefined);
+    const hydratedSections = Array.isArray(rawSections)
+      ? rawSections.map((sec: any) => ({
+          ...sec,
+          originalHtml:
+            typeof sec?.originalHtml === 'string' ? sec.originalHtml : String(sec?.htmlContent || ''),
+        }))
+      : undefined;
+
+    const normalizedState = normalizeEditorState(rawState, hydratedSections, customCss);
+    const updatedAtIso = timestampToIso(data.updatedAt, nowIso);
+    results.push(
+      ensureProjectHasSections({
+        id,
+        ownerId: String(data.ownerId || userId),
+        name: String(data.name || 'Untitled Project'),
+        currentHtml,
+        originalHtml,
+        baseUrl: String(data.baseUrl || 'https://scienceofgifts.com'),
+        customCss: normalizedState.customCss,
+        sections: normalizedState.sections,
+        editorState: normalizedState,
+        createdAt: timestampToIso(data.createdAt, nowIso),
+        updatedAt: updatedAtIso,
+        syncStatus: 'saved_local_and_cloud',
+        pendingCloudSync: false,
+        lastCloudSyncedAt: updatedAtIso,
+      })
+    );
+  }
+
+  results.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return results;
+}
+
+/**
+ * Merges incoming Firestore projects with local IndexedDB projects so that:
+ * 1. Local-only projects not yet in Firestore are preserved and never hidden.
+ * 2. Local projects with `pendingCloudSync === true` or a newer `updatedAt` timestamp
+ *    are never overwritten by an older cloud snapshot.
+ * 3. Cloud projects not present locally (or newer than synced local copies) are restored locally.
+ */
+export function mergeCloudAndLocalHtmlProjects(
+  cloudProjects: HtmlEditorProject[],
+  localProjects: HtmlEditorProject[]
+): HtmlEditorProject[] {
+  const mergedById = new Map<string, HtmlEditorProject>();
+
+  for (const localProj of localProjects) {
+    mergedById.set(localProj.id, localProj);
+  }
+
+  for (const cloudProj of cloudProjects) {
+    const existingLocal = mergedById.get(cloudProj.id);
+    if (!existingLocal) {
+      mergedById.set(cloudProj.id, {
+        ...cloudProj,
+        syncStatus: 'saved_local_and_cloud',
+        pendingCloudSync: false,
+      });
+      continue;
+    }
+
+    const localHasPendingChanges = existingLocal.pendingCloudSync === true;
+    const localTime = Date.parse(existingLocal.updatedAt || '') || 0;
+    const cloudTime = Date.parse(cloudProj.updatedAt || '') || 0;
+
+    if (localHasPendingChanges && localTime >= cloudTime) {
+      // Preserve unsynced local changes over stale cloud snapshot
+      mergedById.set(cloudProj.id, existingLocal);
+    } else if (localTime > cloudTime) {
+      mergedById.set(cloudProj.id, existingLocal);
+    } else {
+      mergedById.set(cloudProj.id, {
+        ...cloudProj,
+        syncStatus: 'saved_local_and_cloud',
+        pendingCloudSync: false,
+      });
+    }
+  }
+
+  return Array.from(mergedById.values()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
 export function subscribeToHtmlProjects(
   userId: string,
   onData: (projects: HtmlEditorProject[]) => void,
@@ -1402,37 +1609,29 @@ export function subscribeToHtmlProjects(
   return onSnapshot(
     q,
     (snap) => {
-      const nowIso = new Date().toISOString();
-      const cloudItems: HtmlEditorProject[] = snap.docs.map((d) => {
-        const data = d.data();
-        const normalizedState = normalizeEditorState(
-          data.editorState,
-          undefined,
-          typeof data.customCss === 'string' ? data.customCss : undefined
-        );
-        return ensureProjectHasSections({
-          id: d.id,
-          ownerId: String(data.ownerId || userId),
-          name: String(data.name || 'Untitled Project'),
-          currentHtml: String(data.currentHtml || ''),
-          originalHtml: String(data.originalHtml ?? data.currentHtml ?? ''),
-          baseUrl: String(data.baseUrl || 'https://scienceofgifts.com'),
-          customCss: normalizedState.customCss,
-          sections: normalizedState.sections,
-          editorState: normalizedState,
-          createdAt: timestampToIso(data.createdAt, nowIso),
-          updatedAt: timestampToIso(data.updatedAt, nowIso),
-        });
+      const rawDocs = snap.docs.map((d) => ({ id: d.id, data: d.data() as Record<string, any> }));
+      void syncCloudFourthwallHeaderCssFromDocs(rawDocs).catch(() => {
+        // Non-blocking cloud Header CSS sync
       });
-      cloudItems.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      if (cloudItems.length > 0) {
-        try {
-          saveLocalHtmlProjectsList(cloudItems);
-        } catch {
-          // Ignore local mirror quota error on cloud subscription
-        }
-      }
-      onData(cloudItems);
+      const cloudItems = reassembleFirestoreHtmlProjects(rawDocs, userId);
+      void hydrateHtmlProjectsFromIdb()
+        .then((localItems) => {
+          const merged = mergeCloudAndLocalHtmlProjects(cloudItems, localItems);
+          if (merged.length > 0) {
+            return saveHtmlProjectsBatchToIdb(merged).then(() => merged);
+          }
+          return merged;
+        })
+        .then((merged) => {
+          onData(merged);
+        })
+        .catch(() => {
+          const fallbackMerged = mergeCloudAndLocalHtmlProjects(
+            cloudItems,
+            getCachedHtmlProjectsSync()
+          );
+          onData(fallbackMerged);
+        });
     },
     (err) => {
       if (onError) onError(err);
@@ -1443,12 +1642,25 @@ export function subscribeToHtmlProjects(
 }
 
 /**
- * Validates and persists an HtmlEditorProject to local storage (and Cloud Firestore when signed in).
- * Throws an explicit Error if validation or storage fails so the UI never falsely displays "Saved".
+ * Validates and persists an HtmlEditorProject to IndexedDB first, then synchronizes with
+ * Cloud Firestore when signed in.
+ * - If IndexedDB persistence fails, throws a classified `StorageDiagnosticError` so the UI
+ *   never falsely displays "Saved".
+ * - If IndexedDB succeeds and the user is signed out, sets `syncStatus: 'saved_local_only'`.
+ * - If IndexedDB succeeds and Firestore sync succeeds, sets `syncStatus: 'saved_local_and_cloud'`.
+ * - If IndexedDB succeeds and Firestore is offline / auth token service is unavailable,
+ *   sets `syncStatus: 'saved_local_cloud_pending'` and `pendingCloudSync: true`.
+ * - If IndexedDB succeeds and Firestore fails with a permission or size error,
+ *   sets `syncStatus: 'saved_local_cloud_failed'`, records `syncDiagnostic`, and throws only
+ *   when `options?.throwOnCloudError` is true.
  */
 export async function saveHtmlProject(
   project: HtmlEditorProject,
-  userId?: string | null
+  userId?: string | null,
+  options?: {
+    firestoreWriter?: (uid: string, proj: HtmlEditorProject) => Promise<string>;
+    throwOnCloudError?: boolean;
+  }
 ): Promise<HtmlEditorProject> {
   const cleanId = sanitizeId(project.id);
   const cleanName = (project.name || '').trim();
@@ -1463,11 +1675,14 @@ export async function saveHtmlProject(
     name: cleanName,
   });
   if (!validation.valid) {
-    throw new Error(validation.error || 'Invalid project data.');
+    throw new StorageDiagnosticError(
+      'validation_error',
+      validation.error || 'Invalid project data.'
+    );
   }
 
   const nowIso = new Date().toISOString();
-  const existingList = loadLocalHtmlProjects();
+  const existingList = getCachedHtmlProjectsSync();
   const existingRecord = existingList.find((p) => p.id === cleanId);
   const normalizedEditorState = normalizeEditorState(
     hydrated.editorState,
@@ -1475,7 +1690,7 @@ export async function saveHtmlProject(
     hydrated.customCss ?? hydrated.editorState?.customCss
   );
 
-  const savedRecord: HtmlEditorProject = {
+  const initialRecord: HtmlEditorProject = {
     id: cleanId,
     ownerId: userId || hydrated.ownerId || 'local-preview',
     name: cleanName,
@@ -1487,21 +1702,75 @@ export async function saveHtmlProject(
     editorState: normalizedEditorState,
     createdAt: existingRecord?.createdAt || hydrated.createdAt || nowIso,
     updatedAt: nowIso,
+    syncStatus: userId ? 'saved_local_cloud_pending' : 'saved_local_only',
+    pendingCloudSync: Boolean(userId),
+    syncDiagnostic: undefined,
+    lastCloudSyncedAt: existingRecord?.lastCloudSyncedAt || hydrated.lastCloudSyncedAt,
   };
 
-  const nextList = existingRecord
-    ? existingList.map((p) => (p.id === cleanId ? savedRecord : p))
-    : [savedRecord, ...existingList];
-
-  nextList.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-  saveLocalHtmlProjectsList(nextList);
-  setActiveLocalHtmlProjectId(savedRecord.id);
-
-  if (userId) {
-    await saveHtmlProjectToFirestore(userId, savedRecord);
+  try {
+    await saveHtmlProjectToIdb(initialRecord);
+  } catch (err) {
+    throw classifyStorageFailure(err, 'idb');
   }
 
-  return savedRecord;
+  if (!userId) {
+    return initialRecord;
+  }
+
+  const writer = options?.firestoreWriter || saveHtmlProjectToFirestore;
+  try {
+    await writer(userId, initialRecord);
+    const syncedRecord: HtmlEditorProject = {
+      ...initialRecord,
+      syncStatus: 'saved_local_and_cloud',
+      pendingCloudSync: false,
+      syncDiagnostic: undefined,
+      lastCloudSyncedAt: new Date().toISOString(),
+    };
+    try {
+      await saveHtmlProjectToIdb(syncedRecord);
+    } catch {
+      // Initial IndexedDB write already succeeded and verified
+    }
+    return syncedRecord;
+  } catch (cloudErr) {
+    if (isOfflineOrTokenServiceError(cloudErr)) {
+      const pendingRecord: HtmlEditorProject = {
+        ...initialRecord,
+        syncStatus: 'saved_local_cloud_pending',
+        pendingCloudSync: true,
+        syncDiagnostic:
+          'Saved locally in IndexedDB. Cloud sync is pending because Firestore is offline or auth token service is unavailable.',
+      };
+      try {
+        await saveHtmlProjectToIdb(pendingRecord);
+      } catch {
+        // Keep local save intact
+      }
+      if (options?.throwOnCloudError) {
+        throw classifyStorageFailure(cloudErr, 'firestore');
+      }
+      return pendingRecord;
+    }
+
+    const classifiedCloudError = classifyStorageFailure(cloudErr, 'firestore');
+    const cloudFailedRecord: HtmlEditorProject = {
+      ...initialRecord,
+      syncStatus: 'saved_local_cloud_failed',
+      pendingCloudSync: true,
+      syncDiagnostic: classifiedCloudError.message,
+    };
+    try {
+      await saveHtmlProjectToIdb(cloudFailedRecord);
+    } catch {
+      // Keep local save intact
+    }
+    if (options?.throwOnCloudError) {
+      throw classifiedCloudError;
+    }
+    return cloudFailedRecord;
+  }
 }
 
 /**
@@ -1524,7 +1793,9 @@ export async function createNewHtmlProject(
   const html = params.initialHtml ?? params.htmlContent ?? '';
   const nowIso = new Date().toISOString();
   const newId = sanitizeId(
-    `proj-${params.name.toLowerCase().slice(0, 32)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`
+    `proj-${params.name.toLowerCase().slice(0, 32)}-${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 5)}`
   );
   const normalizedState = normalizeEditorState(
     params.editorState,
@@ -1559,7 +1830,7 @@ export async function renameHtmlProject(
   if (!cleanName) {
     throw new Error('Project name cannot be empty.');
   }
-  const list = loadLocalHtmlProjects();
+  const list = await hydrateHtmlProjectsFromIdb();
   const target = list.find((p) => p.id === projectId);
   if (!target) {
     throw new Error(`Project "${projectId}" not found.`);
@@ -1581,7 +1852,7 @@ export async function duplicateHtmlProject(
   customName?: string | null,
   userId?: string | null
 ): Promise<HtmlEditorProject> {
-  const list = loadLocalHtmlProjects();
+  const list = await hydrateHtmlProjectsFromIdb();
   const source = list.find((p) => p.id === sourceProjectId);
   if (!source) {
     throw new Error(`Source project "${sourceProjectId}" not found.`);
@@ -1589,7 +1860,9 @@ export async function duplicateHtmlProject(
   const nowIso = new Date().toISOString();
   const copyName = (customName || `${source.name} (Copy)`).trim();
   const newId = sanitizeId(
-    `${source.id}-copy-${Date.now().toString(36).slice(-4)}-${Math.random().toString(36).slice(2, 5)}`
+    `${source.id}-copy-${Date.now().toString(36).slice(-4)}-${Math.random()
+      .toString(36)
+      .slice(2, 5)}`
   );
   const clonedSections = (source.sections || source.editorState?.sections)?.map((sec) => ({
     ...sec,
@@ -1611,24 +1884,215 @@ export async function duplicateHtmlProject(
 }
 
 /**
- * Deletes an HTML Editor project permanently from local storage and Cloud Firestore.
+ * Deletes an HTML Editor project permanently from IndexedDB and Cloud Firestore.
  */
 export async function deleteHtmlProject(
   projectId: string,
   userId?: string | null
 ): Promise<HtmlEditorProject[]> {
-  const list = loadLocalHtmlProjects();
-  const remaining = list.filter((p) => p.id !== projectId);
-  saveLocalHtmlProjectsList(remaining);
-
-  const activeId = getActiveLocalHtmlProjectId();
-  if (activeId === projectId) {
-    setActiveLocalHtmlProjectId(remaining[0]?.id || '');
-  }
+  const remaining = await removeHtmlProjectFromIdb(projectId);
 
   if (userId) {
     await deleteHtmlProjectFromFirestore(userId, projectId);
   }
   return remaining;
 }
+
+// ============================================================================
+// PERSISTENT GLOBAL FOURTHWALL HEADER CSS (LIVE PREVIEW REFERENCE)
+// ============================================================================
+
+export function getFourthwallHeaderCssSync(): FourthwallHeaderCssSetting {
+  return getCachedFourthwallHeaderCssSync();
+}
+
+export async function loadFourthwallHeaderCssAsync(): Promise<FourthwallHeaderCssSetting> {
+  return hydrateFourthwallHeaderCssFromIdb();
+}
+
+function buildHeaderCssCloudMirrorProject(
+  userId: string,
+  setting: FourthwallHeaderCssSetting
+): HtmlEditorProject {
+  const nowIso = setting.updatedAt || new Date().toISOString();
+  return {
+    id: FIRESTORE_GLOBAL_HEADER_CSS_DOC_ID,
+    ownerId: userId,
+    name: 'Fourthwall Header CSS (Live Preview Reference)',
+    currentHtml: setting.currentCss,
+    originalHtml: setting.previousCss || '',
+    baseUrl: 'https://scienceofgifts.com',
+    customCss: setting.currentCss,
+    editorState: {
+      viewMode: 'css',
+      selectedBlockId: 'ALL',
+      previewViewport: 'desktop',
+      includeFourthwallCss: true,
+      customCss: setting.currentCss,
+      isGlobalHeaderCssSetting: true,
+    } as HtmlProjectEditorState & { isGlobalHeaderCssSetting: boolean },
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
+}
+
+export async function syncCloudFourthwallHeaderCssFromDocs(
+  rawDocs: Array<{ id: string; data: Record<string, any> }>
+): Promise<FourthwallHeaderCssSetting | null> {
+  const parentDoc = rawDocs.find(
+    (d) =>
+      d.id === FIRESTORE_GLOBAL_HEADER_CSS_DOC_ID ||
+      d.data?.editorState?.isGlobalHeaderCssSetting === true
+  );
+  if (!parentDoc) return null;
+
+  const docById = new Map<string, Record<string, any>>();
+  for (const d of rawDocs) {
+    docById.set(d.id, d.data);
+  }
+
+  const rawState = (parentDoc.data.editorState || {}) as Record<string, any>;
+  let currentCss = String(parentDoc.data.currentHtml || '');
+  let previousCss: string | null =
+    typeof parentDoc.data.originalHtml === 'string' && parentDoc.data.originalHtml.trim()
+      ? parentDoc.data.originalHtml
+      : null;
+
+  if (rawState.isChunkedParent === true && Array.isArray(rawState.chunkPartIds)) {
+    const slices: string[] = [];
+    let allPresent = rawState.chunkPartIds.length > 0;
+    for (const partId of rawState.chunkPartIds) {
+      const partDoc = docById.get(String(partId));
+      if (!partDoc || typeof partDoc.currentHtml !== 'string') {
+        allPresent = false;
+        break;
+      }
+      slices.push(partDoc.currentHtml);
+    }
+    if (allPresent) {
+      try {
+        const parsed = JSON.parse(slices.join('')) as ChunkedPayloadEnvelope;
+        if (typeof parsed.currentHtml === 'string' && parsed.currentHtml.trim()) {
+          currentCss = parsed.currentHtml;
+        }
+        if (typeof parsed.originalHtml === 'string') {
+          previousCss = parsed.originalHtml.trim() ? parsed.originalHtml : null;
+        }
+      } catch {
+        // Keep parent preview fields if chunk envelope is malformed
+      }
+    }
+  }
+
+  if (!currentCss.trim()) return null;
+
+  const cloudUpdatedAt = timestampToIso(parentDoc.data.updatedAt, new Date().toISOString());
+  const localSetting = await hydrateFourthwallHeaderCssFromIdb();
+  const localTime = Date.parse(localSetting.updatedAt || '') || 0;
+  const cloudTime = Date.parse(cloudUpdatedAt || '') || 0;
+
+  // Never overwrite newer local Header CSS during cloud sync
+  if (localSetting.isCustomized && localTime >= cloudTime) {
+    return localSetting;
+  }
+
+  return saveFourthwallHeaderCssToIdb(currentCss, {
+    preservePreviousOverride: previousCss,
+    updatedAt: cloudUpdatedAt,
+    syncStatus: 'saved_local_and_cloud',
+  });
+}
+
+/**
+ * Saves an updated Fourthwall Header CSS stylesheet persistently in IndexedDB (and Cloud Firestore when signed in).
+ * Automatically preserves the previous saved version so it can be restored if needed.
+ */
+export async function saveFourthwallHeaderCss(
+  nextCssInput: string,
+  userId?: string | null,
+  options?: {
+    firestoreWriter?: (uid: string, proj: HtmlEditorProject) => Promise<string>;
+    throwOnCloudError?: boolean;
+  }
+): Promise<FourthwallHeaderCssSetting> {
+  const savedLocal = await saveFourthwallHeaderCssToIdb(nextCssInput, {
+    syncStatus: userId ? 'saved_local_cloud_pending' : 'saved_local_only',
+  });
+
+  if (!userId) {
+    return savedLocal;
+  }
+
+  const writer = options?.firestoreWriter || saveHtmlProjectToFirestore;
+  const cloudMirror = buildHeaderCssCloudMirrorProject(userId, savedLocal);
+
+  try {
+    await writer(userId, cloudMirror);
+    return await saveFourthwallHeaderCssToIdb(savedLocal.currentCss, {
+      preservePreviousOverride: savedLocal.previousCss,
+      updatedAt: savedLocal.updatedAt,
+      syncStatus: 'saved_local_and_cloud',
+    });
+  } catch (cloudErr) {
+    if (isOfflineOrTokenServiceError(cloudErr)) {
+      const pending = await saveFourthwallHeaderCssToIdb(savedLocal.currentCss, {
+        preservePreviousOverride: savedLocal.previousCss,
+        updatedAt: savedLocal.updatedAt,
+        syncStatus: 'saved_local_cloud_pending',
+        syncDiagnostic:
+          'Saved locally in IndexedDB. Cloud sync is pending because Firestore is offline or auth token service is unavailable.',
+      });
+      if (options?.throwOnCloudError) {
+        throw classifyStorageFailure(cloudErr, 'firestore');
+      }
+      return pending;
+    }
+
+    const classified = classifyStorageFailure(cloudErr, 'firestore');
+    const failedCloud = await saveFourthwallHeaderCssToIdb(savedLocal.currentCss, {
+      preservePreviousOverride: savedLocal.previousCss,
+      updatedAt: savedLocal.updatedAt,
+      syncStatus: 'saved_local_cloud_failed',
+      syncDiagnostic: classified.message,
+    });
+    if (options?.throwOnCloudError) {
+      throw classified;
+    }
+    return failedCloud;
+  }
+}
+
+/**
+ * Restores the previous saved version of the Fourthwall Header CSS in IndexedDB (and Cloud Firestore when signed in).
+ */
+export async function restorePreviousFourthwallHeaderCss(
+  userId?: string | null,
+  options?: {
+    firestoreWriter?: (uid: string, proj: HtmlEditorProject) => Promise<string>;
+    throwOnCloudError?: boolean;
+  }
+): Promise<FourthwallHeaderCssSetting> {
+  const restoredLocal = await restorePreviousFourthwallHeaderCssInIdb();
+  if (!userId) {
+    return restoredLocal;
+  }
+
+  const writer = options?.firestoreWriter || saveHtmlProjectToFirestore;
+  const cloudMirror = buildHeaderCssCloudMirrorProject(userId, restoredLocal);
+
+  try {
+    await writer(userId, cloudMirror);
+    return await saveFourthwallHeaderCssToIdb(restoredLocal.currentCss, {
+      preservePreviousOverride: restoredLocal.previousCss,
+      updatedAt: restoredLocal.updatedAt,
+      syncStatus: 'saved_local_and_cloud',
+    });
+  } catch (cloudErr) {
+    if (options?.throwOnCloudError) {
+      throw classifyStorageFailure(cloudErr, 'firestore');
+    }
+    return restoredLocal;
+  }
+}
+
 

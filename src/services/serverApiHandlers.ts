@@ -16,9 +16,35 @@ import {
   executeGeminiWithFallback,
 } from './geminiModelConfig';
 
-export interface ServerEnvironment {
+import {
+  DEFAULT_CUSTOM_IMAGE_DOMAIN,
+  DEFAULT_FEATURED_MAX_WIDTH,
+  DEFAULT_STANDARD_MAX_WIDTH,
+  DEFAULT_WEBP_QUALITY,
+  buildOptimizedImageFilename,
+  buildPublicOptimizedImageUrl,
+  buildR2ObjectKey,
+  deriveProductSlugFromUrl,
+  normalizeCustomImageDomain,
+  sanitizeVariantSuffix,
+} from './imageOptimizerCore';
+import {
+  R2EnvironmentConfig,
+  getR2ConfigurationStatus,
+  uploadWebpToCloudflareR2,
+} from './imageR2Upload';
+import {
+  CloudflareImagesBinding,
+  ImageProcessInput,
+  ImageProcessOutput,
+  processImageWithCloudflareImages,
+} from './cloudflareImagesProcessor';
+import type { GoogleJwkSet } from './firebaseTokenVerifier';
+
+export interface ServerEnvironment extends R2EnvironmentConfig {
   GEMINI_API_KEY?: string;
   APP_URL?: string;
+  IMAGES?: CloudflareImagesBinding;
 }
 
 export interface GenAIModelInvoker {
@@ -42,6 +68,28 @@ export interface ApiHandlerOptions {
    * Optional custom sleep function for testing Retry-After behavior without waiting.
    */
   sleepMs?: (ms: number) => Promise<void>;
+  /**
+   * Optional image processor hook (e.g. `processImageWithSharp` on Node.js; defaults to Cloudflare `env.IMAGES` binding on Workers).
+   */
+  imageProcessor?: (input: ImageProcessInput) => Promise<ImageProcessOutput>;
+  /**
+   * Optional custom image fetcher for testing image downloads without external network calls.
+   */
+  customImageBytesFetcher?: (
+    url: string
+  ) => Promise<{ bytes: Uint8Array; contentType: string; finalUrl: string }>;
+  /**
+   * Optional custom fetch for testing R2 S3-compatible uploads and JWK key retrieval.
+   */
+  customFetch?: typeof fetch;
+  /**
+   * Optional JWK set override for testing Firebase ID token verification deterministically.
+   */
+  customJwkSet?: GoogleJwkSet;
+  /**
+   * Optional timestamp override (in seconds) for testing Firebase ID token expiration.
+   */
+  nowSeconds?: number;
 }
 
 export interface ApiHandlerResult<T = Record<string, unknown>> {
@@ -956,3 +1004,443 @@ export async function handleAiGenerateRequest(
     };
   }
 }
+
+// ============================================================================
+// BULK PRODUCT IMAGE OPTIMIZER & CLOUDFLARE R2 UPLOAD HANDLERS
+// ============================================================================
+
+export function uint8ArrayToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
+  }
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.byteLength; i += chunkSize) {
+    const sub = bytes.subarray(i, Math.min(i + chunkSize, bytes.byteLength));
+    binary += String.fromCharCode(...sub);
+  }
+  return btoa(binary);
+}
+
+export function base64ToUint8Array(base64: string): Uint8Array {
+  const clean = (base64 || '')
+    .trim()
+    .replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/i, '');
+  if (!clean) return new Uint8Array(0);
+  if (typeof Buffer !== 'undefined') {
+    const buf = Buffer.from(clean, 'base64');
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
+  const binary = atob(clean);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+/**
+ * Downloads a public product image URL with SSRF protection, redirect validation,
+ * content-type verification, a 12-second timeout, and a 15 MB size limit.
+ */
+export async function fetchPublicImageBytesSafely(
+  initialUrl: string,
+  options?: ApiHandlerOptions
+): Promise<{
+  bytes: Uint8Array;
+  contentType: string;
+  finalUrl: string;
+}> {
+  if (options?.customImageBytesFetcher) {
+    const check = validateFetchableProductUrl(initialUrl);
+    if (!check.valid || !check.normalizedUrl) {
+      throw new Error(check.error || 'Unsafe or invalid image URL blocked.');
+    }
+    return options.customImageBytesFetcher(check.normalizedUrl);
+  }
+
+  let currentUrl = initialUrl;
+  const maxRedirects = 3;
+
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const check = validateFetchableProductUrl(currentUrl);
+    if (!check.valid || !check.normalizedUrl) {
+      throw new Error(check.error || 'Unsafe or invalid image URL blocked.');
+    }
+    const parsed = new URL(check.normalizedUrl);
+    if (isPrivateOrInternalHost(parsed.hostname)) {
+      throw new Error('Target image host is restricted (private or internal network).');
+    }
+    if (options?.assertPublicDns) {
+      await options.assertPublicDns(parsed.hostname);
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+
+    try {
+      const response = await fetch(parsed.toString(), {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (compatible; ScienceOfGiftsImageOptimizer/1.0; +https://scienceofgifts.com)',
+          Accept: 'image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5',
+        },
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location');
+        if (!location) {
+          throw new Error(`Image redirect (${response.status}) missing Location header.`);
+        }
+        if (hop === maxRedirects) {
+          throw new Error('Too many redirects while downloading image URL (max 3 allowed).');
+        }
+        currentUrl = new URL(location, parsed.toString()).toString();
+        continue;
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          `Image URL returned HTTP ${response.status} (${
+            response.statusText || 'Image inaccessible'
+          }).`
+        );
+      }
+
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      if (
+        contentType &&
+        (contentType.includes('text/html') ||
+          contentType.includes('application/json') ||
+          contentType.includes('text/plain'))
+      ) {
+        throw new Error(
+          `URL returned "${contentType}" instead of an image file. Verify the image URL is a direct image asset.`
+        );
+      }
+
+      const maxBytes = 15 * 1024 * 1024; // 15 MB max source image
+      const reader = response.body?.getReader();
+      if (!reader) {
+        const ab = await response.arrayBuffer();
+        if (ab.byteLength > maxBytes) {
+          throw new Error('Source image exceeds the 15 MB download limit.');
+        }
+        return {
+          bytes: new Uint8Array(ab),
+          contentType: contentType || 'image/jpeg',
+          finalUrl: parsed.toString(),
+        };
+      }
+
+      const chunks: Uint8Array[] = [];
+      let totalBytes = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          totalBytes += value.byteLength;
+          if (totalBytes > maxBytes) {
+            await reader.cancel();
+            throw new Error('Source image exceeds the 15 MB download limit.');
+          }
+          chunks.push(value);
+        }
+      }
+
+      const bytes = concatUint8Arrays(chunks, totalBytes);
+      if (bytes.byteLength === 0) {
+        throw new Error('Downloaded image file is empty (0 bytes).');
+      }
+
+      return {
+        bytes,
+        contentType: contentType || 'image/jpeg',
+        finalUrl: parsed.toString(),
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  throw new Error('Failed to download source image.');
+}
+
+export function handleImageOptimizerStatusRequest(env: ServerEnvironment): ApiHandlerResult {
+  const r2Status = getR2ConfigurationStatus(env);
+  const imagesBindingConfigured = Boolean(
+    env?.IMAGES && typeof env.IMAGES.input === 'function'
+  );
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      r2: r2Status,
+      imagesBindingConfigured,
+      defaults: {
+        customDomain: r2Status.publicBaseUrl || DEFAULT_CUSTOM_IMAGE_DOMAIN,
+        standardMaxWidth: DEFAULT_STANDARD_MAX_WIDTH,
+        featuredMaxWidth: DEFAULT_FEATURED_MAX_WIDTH,
+        quality: DEFAULT_WEBP_QUALITY,
+      },
+    },
+  };
+}
+
+export async function handleImageOptimizeRequest(
+  body: Record<string, any> | null | undefined,
+  env: ServerEnvironment,
+  options?: ApiHandlerOptions
+): Promise<ApiHandlerResult> {
+  if (!body || typeof body !== 'object') {
+    return {
+      status: 400,
+      body: { ok: false, error: 'Invalid request payload.' },
+    };
+  }
+
+  const rawImageUrl = String(body.imageUrl || '').trim();
+  const rawProductPageUrl = String(body.productPageUrl || '').trim();
+  const rawProductSlug = String(body.productSlug || '').trim();
+  const variantSuffix = sanitizeVariantSuffix(body.variantSuffix);
+  const imageRole =
+    body.imageRole === 'featured' || body.role === 'featured' ? 'featured' : 'standard';
+  const maxWidth = Number(
+    body.maxWidth ||
+      (imageRole === 'featured' ? DEFAULT_FEATURED_MAX_WIDTH : DEFAULT_STANDARD_MAX_WIDTH)
+  );
+  const quality = Number(body.quality || DEFAULT_WEBP_QUALITY);
+  const customDomain = normalizeCustomImageDomain(
+    String(
+      body.customDomain ||
+        body.publicBaseUrl ||
+        env.R2_PUBLIC_BASE_URL ||
+        DEFAULT_CUSTOM_IMAGE_DOMAIN
+    )
+  );
+
+  if (!rawImageUrl) {
+    return {
+      status: 400,
+      body: { ok: false, error: 'Original product image URL (imageUrl) is required.' },
+    };
+  }
+
+  const derivedSlug = deriveProductSlugFromUrl(
+    rawProductSlug || rawProductPageUrl,
+    String(body.productName || '')
+  );
+  if (!derivedSlug) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error:
+          'Could not derive a valid product slug. Provide a productPageUrl (e.g. /products/viking-raven-t-shirt) or productSlug.',
+      },
+    };
+  }
+
+  let filename = '';
+  let objectKey = '';
+  try {
+    filename = buildOptimizedImageFilename(derivedSlug, variantSuffix);
+    objectKey = buildR2ObjectKey(filename);
+  } catch (err) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Invalid filename or R2 object key.',
+      },
+    };
+  }
+
+  const optimizedImageUrl = buildPublicOptimizedImageUrl(customDomain, objectKey);
+
+  const processor: ((input: ImageProcessInput) => Promise<ImageProcessOutput>) | null =
+    options?.imageProcessor
+      ? options.imageProcessor
+      : env?.IMAGES && typeof env.IMAGES.input === 'function'
+      ? (input) => processImageWithCloudflareImages(input, env.IMAGES)
+      : null;
+
+  if (!processor) {
+    return {
+      status: 503,
+      body: {
+        ok: false,
+        error:
+          'Image optimization processor is not configured. On Cloudflare Workers, ensure `[images] binding = "IMAGES"` is configured in wrangler.toml.',
+        originalImageUrl: rawImageUrl,
+        productSlug: derivedSlug,
+      },
+    };
+  }
+
+  try {
+    const { bytes: sourceBytes } = await fetchPublicImageBytesSafely(rawImageUrl, options);
+    const processed = await processor({
+      inputBytes: sourceBytes,
+      maxWidth,
+      quality,
+    });
+
+    const optimizedWebpBase64 = uint8ArrayToBase64(processed.webpBytes);
+
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        productSlug: derivedSlug,
+        variantSuffix,
+        filename,
+        objectKey,
+        r2ObjectKey: objectKey,
+        originalImageUrl: rawImageUrl,
+        optimizedImageUrl,
+        imageRole,
+        role: imageRole,
+        maxWidth: Math.round(maxWidth),
+        targetMaxWidth: Math.round(maxWidth),
+        quality: Math.round(quality),
+        originalFormat: processed.originalFormat,
+        hasAlpha: processed.hasAlpha,
+        originalDimensions: {
+          width: processed.originalWidth,
+          height: processed.originalHeight,
+        },
+        optimizedDimensions: {
+          width: processed.optimizedWidth,
+          height: processed.optimizedHeight,
+        },
+        originalFileSize: processed.originalSize,
+        optimizedFileSize: processed.optimizedSize,
+        originalFileSizeBytes: processed.originalSize,
+        optimizedFileSizeBytes: processed.optimizedSize,
+        sourceContentHash: processed.sourceSha256,
+        optimizedSha256: processed.optimizedSha256,
+        webpSha256: processed.optimizedSha256,
+        optimizedWebpBase64,
+        webpBase64: optimizedWebpBase64,
+        lastOptimizedAt: new Date().toISOString(),
+        optimizedAt: new Date().toISOString(),
+      },
+    };
+  } catch (err) {
+    const msg =
+      err instanceof Error
+        ? err.name === 'AbortError'
+          ? 'Image download timed out after 12 seconds.'
+          : err.message
+        : 'Failed to optimize product image.';
+    return {
+      status: 422,
+      body: {
+        ok: false,
+        error: msg,
+        originalImageUrl: rawImageUrl,
+        productSlug: derivedSlug,
+      },
+    };
+  }
+}
+
+export async function handleImageUploadR2Request(
+  body: Record<string, any> | null | undefined,
+  env: ServerEnvironment,
+  requestHeaders?: {
+    authorization?: string | null;
+    cmsClient?: string | null;
+    cmsClientHeader?: string | null;
+  },
+  options?: ApiHandlerOptions
+): Promise<ApiHandlerResult> {
+  if (!body || typeof body !== 'object') {
+    return {
+      status: 400,
+      body: { ok: false, error: 'Invalid R2 upload request body.' },
+    };
+  }
+
+  const objectKey = String(body.objectKey || '').trim();
+  const webpBase64 = String(body.webpBase64 || '').trim();
+  const contentType = String(body.contentType || 'image/webp').trim();
+  const customDomain = String(
+    body.customDomain || body.publicBaseUrl || env.R2_PUBLIC_BASE_URL || DEFAULT_CUSTOM_IMAGE_DOMAIN
+  ).trim();
+  const overwrite = Boolean(body.overwrite);
+  const previousContentSha256 =
+    typeof body.previousContentSha256 === 'string' ? body.previousContentSha256.trim() : undefined;
+
+  if (!webpBase64) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: 'Missing optimized WebP payload (webpBase64). Optimize the image first.',
+      },
+    };
+  }
+
+  let webpBytes: Uint8Array;
+  try {
+    webpBytes = base64ToUint8Array(webpBase64);
+  } catch {
+    return {
+      status: 400,
+      body: { ok: false, error: 'Malformed base64 image payload.' },
+    };
+  }
+
+  const uploadRes = await uploadWebpToCloudflareR2(
+    {
+      objectKey,
+      webpBytes,
+      contentType,
+      customDomain,
+      overwrite,
+      previousContentSha256,
+      authHeader: requestHeaders?.authorization,
+      cmsClientHeader: requestHeaders?.cmsClient ?? requestHeaders?.cmsClientHeader,
+    },
+    env,
+    {
+      customFetch: options?.customFetch,
+      customJwkSet: options?.customJwkSet,
+      nowSeconds: options?.nowSeconds,
+    }
+  );
+
+  if (!uploadRes.ok) {
+    return {
+      status: uploadRes.status,
+      body: {
+        ok: false,
+        error: uploadRes.error || 'R2 upload failed.',
+      },
+    };
+  }
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      mode: uploadRes.mode,
+      objectKey: uploadRes.objectKey,
+      publicUrl: uploadRes.publicUrl,
+      bytesUploaded: uploadRes.bytesUploaded,
+      sha256: uploadRes.sha256,
+      skippedDuplicate: Boolean(uploadRes.skippedDuplicate),
+      skippedUnchanged: Boolean(uploadRes.skippedUnchanged ?? uploadRes.skippedDuplicate),
+      authenticatedUserEmail: uploadRes.authenticatedUserEmail,
+      authenticatedUserUid: uploadRes.authenticatedUserUid,
+      uploadedAt: new Date().toISOString(),
+    },
+  };
+}
+

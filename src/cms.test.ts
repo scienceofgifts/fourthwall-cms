@@ -62,20 +62,37 @@ import {
   DEFAULT_GIFT_GUIDE_CSS,
   buildFourthwallExportCode,
   buildPreviewIframeDocument,
+  normalizeHeaderCssInput,
   resolveProjectCss,
   updateProjectCss,
 } from './services/htmlWorkspaceEngine';
 import {
+  FIRESTORE_GLOBAL_HEADER_CSS_DOC_ID,
+  StorageDiagnosticError,
+  buildFirestoreHtmlProjectPayloads,
+  classifyStorageFailure,
+  createMockIndexedDbFactory,
   createNewHtmlProject,
   deleteHtmlProject,
   duplicateHtmlProject,
+  getActiveHtmlProjectIdAsync,
   getActiveLocalHtmlProjectId,
+  getFourthwallHeaderCssSync,
   isOfflineOrTokenServiceError,
+  loadFourthwallHeaderCssAsync,
   loadLocalCatalogProducts,
+  loadLocalCatalogProductsAsync,
   loadLocalHtmlProjects,
+  loadLocalHtmlProjectsAsync,
+  mergeCloudAndLocalHtmlProjects,
+  reassembleFirestoreHtmlProjects,
   renameHtmlProject,
+  restorePreviousFourthwallHeaderCss,
+  saveFourthwallHeaderCss,
   saveHtmlProject,
   saveLocalCatalogProducts,
+  simulateBrowserReloadForTesting,
+  syncCloudFourthwallHeaderCssFromDocs,
   validateHtmlProjectForSave,
   validateUserAuthToken,
 } from './services/firebase';
@@ -111,10 +128,61 @@ import {
   handleAiAnalyzeHtmlRequest,
   handleAiGenerateRequest,
   handleAiStatusRequest,
+  handleImageOptimizeRequest,
+  handleImageOptimizerStatusRequest,
+  handleImageUploadR2Request,
   handleProductParseHtmlRequest,
 } from './services/serverApiHandlers';
+import {
+  LEGACY_LOCAL_HTML_PROJECTS_KEY,
+  LOCAL_ACTIVE_HTML_PROJECT_ID_KEY,
+  LOCAL_HTML_PROJECTS_MIGRATED_KEY,
+  deleteImageMappingFromIdb,
+  getAllImageMappingsFromIdb,
+  hydrateHtmlProjectsFromIdb,
+  migrateLocalStorageProjectsToIdb,
+  removeHtmlProjectFromIdb,
+  resetIdbStorageForTesting,
+  saveHtmlProjectToIdb,
+  saveImageMappingsToIdb,
+  setSimulatedIdbFailureForTesting,
+} from './services/projectStorageIdb';
+import {
+  assignDeterministicSuffixesForProductImages,
+  buildOptimizedImageFilename,
+  buildPublicOptimizedImageUrl,
+  buildR2ObjectKey,
+  calculateProportionalDimensions,
+  deriveProductSlugFromUrl,
+  replaceGuideHtmlImageUrls,
+  scanGuideHtmlForImages,
+  validateR2ObjectKey,
+} from './services/imageOptimizerCore';
+import {
+  computeSha256Hex,
+  getR2ConfigurationStatus,
+  isWebpBinary,
+  uploadWebpToCloudflareR2,
+} from './services/imageR2Upload';
+import {
+  CloudflareImagesBinding,
+  parseImageHeaderMetadata,
+  processImageWithCloudflareImages,
+} from './services/cloudflareImagesProcessor';
+import {
+  GoogleJwkSet,
+  verifyFirebaseIdTokenForR2Upload,
+} from './services/firebaseTokenVerifier';
+import { processImageWithSharp } from './services/nodeSharpProcessor';
+import sharp from 'sharp';
 import { handleWorkerRequest } from '../workers';
-import { GiftGuide, GuideSection, HtmlEditorProject, Product } from './types/cms';
+import {
+  GiftGuide,
+  GuideSection,
+  HtmlEditorProject,
+  Product,
+  ProductImageMappingRecord,
+} from './types/cms';
 
 const sampleProducts: Product[] = SEED_PRODUCTS.map((p) => ({
   ...p,
@@ -832,8 +900,8 @@ describe('Persistent HTML Editor Projects & Preview Image Resolution (All 10 Req
     expect(afterDelete[0].id).toBe(duplicated.id);
   });
 
-  it('4. surfaces an actionable error and never falsely succeeds when saving fails (quota or validation error)', async () => {
-    const failingStorage = {
+  it('4. surfaces an actionable error and never falsely succeeds when IndexedDB saving fails (quota or validation error), while succeeding if only localStorage is full', async () => {
+    const failingLocalStorage = {
       getItem: () => null,
       setItem: () => {
         throw new Error('QuotaExceededError: Persistent storage limit reached');
@@ -841,10 +909,14 @@ describe('Persistent HTML Editor Projects & Preview Image Resolution (All 10 Req
       removeItem: () => {},
     };
     Object.defineProperty(globalThis, 'window', {
-      value: { localStorage: failingStorage },
+      value: {
+        localStorage: failingLocalStorage,
+        indexedDB: createMockIndexedDbFactory(),
+      },
       configurable: true,
       writable: true,
     });
+    resetIdbStorageForTesting();
 
     const validProj: HtmlEditorProject = {
       id: 'proj-quota-test',
@@ -864,9 +936,19 @@ describe('Persistent HTML Editor Projects & Preview Image Resolution (All 10 Req
       updatedAt: new Date().toISOString(),
     };
 
-    await expect(saveHtmlProject(validProj)).rejects.toThrow(
-      /Failed to persist project to browser storage/
-    );
+    try {
+      setSimulatedIdbFailureForTesting('quota_exceeded');
+      await expect(saveHtmlProject(validProj)).rejects.toThrow(
+        /IndexedDB quota exceeded/i
+      );
+    } finally {
+      setSimulatedIdbFailureForTesting('none');
+    }
+
+    // When IndexedDB is available, a localStorage QuotaExceededError must NOT cause saveHtmlProject to fail
+    const savedDespiteFullLocalStorage = await saveHtmlProject(validProj);
+    expect(savedDespiteFullLocalStorage.id).toBe('proj-quota-test');
+    expect(await getActiveHtmlProjectIdAsync()).toBe('proj-quota-test');
 
     // Also test validation error for empty project name
     const emptyNameValidation = validateHtmlProjectForSave({
@@ -2765,3 +2847,1483 @@ describe('Feature 9: Replaceable & Preview-Synced Gift Guide CSS Editor', () => 
     expect(htmlOnlyExport).toContain('Section 2 FAQ');
   });
 });
+
+describe('Feature 10: IndexedDB Project Persistence, Bulk Sharp Image Optimizer, Deterministic Slugs, R2 Upload, and Guide HTML Link Replacement', () => {
+  it('1. migrates existing localStorage projects to IndexedDB once, verifies read-back integrity, and removes the large localStorage project payload', async () => {
+    const store = new Map<string, string>();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => store.set(k, v),
+          removeItem: (k: string) => store.delete(k),
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+
+    const legacyProjects = [
+      {
+        id: 'legacy-proj-1',
+        ownerId: 'local-preview',
+        name: 'Legacy Roman Empire Guide',
+        currentHtml: '<section class="sog-guide-container"><h2>Roman Legion Picks</h2></section>',
+        originalHtml: '<section class="sog-guide-container"><h2>Roman Legion Picks</h2></section>',
+        baseUrl: 'https://scienceofgifts.com',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-02T00:00:00.000Z',
+      },
+      {
+        id: 'legacy-proj-2',
+        ownerId: 'local-preview',
+        name: 'Legacy Viking History Guide',
+        currentHtml: '<section class="sog-guide-container"><h2>Viking Raven Picks</h2></section>',
+        originalHtml: '<section class="sog-guide-container"><h2>Viking Raven Picks</h2></section>',
+        baseUrl: 'https://scienceofgifts.com',
+        createdAt: '2026-01-03T00:00:00.000Z',
+        updatedAt: '2026-01-04T00:00:00.000Z',
+      },
+    ];
+
+    store.set(LEGACY_LOCAL_HTML_PROJECTS_KEY, JSON.stringify(legacyProjects));
+
+    const migrationResult = await migrateLocalStorageProjectsToIdb();
+    expect(migrationResult.migratedCount).toBe(2);
+    expect(migrationResult.alreadyMigrated).toBe(false);
+
+    // Verify large project list was removed from localStorage after verified IndexedDB write
+    expect(store.has(LEGACY_LOCAL_HTML_PROJECTS_KEY)).toBe(false);
+    // Verify lightweight migration metadata was recorded in localStorage
+    expect(store.get(LOCAL_HTML_PROJECTS_MIGRATED_KEY)).toContain('"migratedCount":2');
+
+    // Hydrate from IndexedDB and verify both projects are intact
+    const hydrated = await hydrateHtmlProjectsFromIdb();
+    expect(hydrated).toHaveLength(2);
+    expect(hydrated.map((p) => p.id).sort()).toEqual(['legacy-proj-1', 'legacy-proj-2']);
+
+    // Running migration a second time is a no-op
+    const secondRun = await migrateLocalStorageProjectsToIdb();
+    expect(secondRun.alreadyMigrated).toBe(true);
+  });
+
+  it('2. saves, loads, updates, and deletes a large multi-project collection (> 5.2 MB total HTML) in IndexedDB without hitting the old ~4.1 MB localStorage limit', async () => {
+    const store = new Map<string, string>();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => {
+            if (v.length > 4_000_000) {
+              throw new Error('QuotaExceededError: localStorage 4MB limit exceeded');
+            }
+            store.set(k, v);
+          },
+          removeItem: (k: string) => store.delete(k),
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+
+    // Create 15 large projects totaling > 5.2 MB across currentHtml + originalHtml + sections
+    const repeatedCardChunk =
+      '<article class="sog-ed-card"><h3>Historical Artifact Replica</h3><p>' +
+      'Detailed museum-grade historical gift description and archival provenance notes. '.repeat(25) +
+      '</p></article>\n';
+    const largeSectionHtml = `<section class="sog-guide-container">\n${repeatedCardChunk.repeat(68)}</section>`;
+    expect(largeSectionHtml.length).toBeGreaterThan(130_000);
+
+    const createdIds: string[] = [];
+    for (let i = 1; i <= 15; i++) {
+      const created = await createNewHtmlProject({
+        name: `Large Historical Gift Guide #${i}`,
+        htmlContent: largeSectionHtml,
+      });
+      createdIds.push(created.id);
+    }
+
+    const allProjects = await hydrateHtmlProjectsFromIdb();
+    expect(allProjects).toHaveLength(15);
+
+    const totalSerializedBytes = JSON.stringify(allProjects).length;
+    // Total collection exceeds 5.2 MB (well above the old 4.1 MB localStorage failure threshold)
+    expect(totalSerializedBytes).toBeGreaterThan(5_200_000);
+
+    // Ensure full project collection is NOT stored in localStorage
+    expect(store.has(LEGACY_LOCAL_HTML_PROJECTS_KEY)).toBe(false);
+    expect(store.get(LOCAL_ACTIVE_HTML_PROJECT_ID_KEY)).toBe(createdIds[14]);
+
+    // Update one of the projects and verify persistence
+    const targetToUpdate = allProjects.find((p) => p.id === createdIds[0])!;
+    const updatedProj = await saveHtmlProject({
+      ...targetToUpdate,
+      name: 'Updated Large Historical Guide #1',
+    });
+    expect(updatedProj.name).toBe('Updated Large Historical Guide #1');
+
+    // Delete one project and verify 14 remain
+    await deleteHtmlProject(createdIds[1]);
+    const remaining = await hydrateHtmlProjectsFromIdb();
+    expect(remaining).toHaveLength(14);
+    expect(remaining.some((p) => p.id === createdIds[1])).toBe(false);
+  });
+
+  it('3. surfaces actionable IndexedDB errors when unavailable, blocked, or failing verification, and never falsely succeeds', async () => {
+    const store = new Map<string, string>();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => store.set(k, v),
+          removeItem: (k: string) => store.delete(k),
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+
+    const sampleProject: HtmlEditorProject = {
+      id: 'idb-error-test-proj',
+      ownerId: 'local-preview',
+      name: 'IDB Failure Test Project',
+      currentHtml: '<section><h2>Test</h2></section>',
+      originalHtml: '<section><h2>Test</h2></section>',
+      baseUrl: 'https://scienceofgifts.com',
+      editorState: {
+        viewMode: 'split',
+        selectedBlockId: 'ALL',
+        sidebarTab: 'blocks',
+        previewViewport: 'desktop',
+        includeFourthwallCss: true,
+      },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    try {
+      setSimulatedIdbFailureForTesting('unavailable');
+      await expect(saveHtmlProject(sampleProject)).rejects.toThrow(/IndexedDB is unavailable/i);
+
+      setSimulatedIdbFailureForTesting('blocked');
+      await expect(saveHtmlProject(sampleProject)).rejects.toThrow(/blocked by another open tab/i);
+
+      setSimulatedIdbFailureForTesting('verification_mismatch');
+      await expect(saveHtmlProjectToIdb(sampleProject)).rejects.toThrow(
+        /write verification failed/i
+      );
+    } finally {
+      setSimulatedIdbFailureForTesting('none');
+    }
+  });
+
+  it('4, 5 & 6. resizes landscape, portrait, and square images proportionally with Sharp without cropping, never upscales smaller images, and preserves RGBA transparency in WebP', async () => {
+    // 4a. Landscape 1600x1200 (4:3) -> resized to 600x450
+    const landscapePng = await sharp({
+      create: {
+        width: 1600,
+        height: 1200,
+        channels: 4,
+        background: { r: 30, g: 64, b: 175, alpha: 1 },
+      },
+    })
+      .png()
+      .toBuffer();
+
+    const landscapeResult = await processImageWithSharp(
+      new Uint8Array(landscapePng),
+      600,
+      80
+    );
+    expect(landscapeResult.originalWidth).toBe(1600);
+    expect(landscapeResult.originalHeight).toBe(1200);
+    expect(landscapeResult.width).toBe(600);
+    expect(landscapeResult.height).toBe(450);
+    expect(landscapeResult.wasResized).toBe(true);
+    expect(isWebpBinary(landscapeResult.webpBytes)).toBe(true);
+
+    // 4b. Portrait 1200x1800 (2:3) -> resized to 600x900 (uncropped aspect ratio preserved!)
+    const portraitPng = await sharp({
+      create: {
+        width: 1200,
+        height: 1800,
+        channels: 4,
+        background: { r: 124, g: 45, b: 18, alpha: 1 },
+      },
+    })
+      .png()
+      .toBuffer();
+
+    const portraitResult = await processImageWithSharp(
+      new Uint8Array(portraitPng),
+      600,
+      80
+    );
+    expect(portraitResult.width).toBe(600);
+    expect(portraitResult.height).toBe(900);
+    expect(portraitResult.wasResized).toBe(true);
+
+    // 4c. Square 1200x1200 (1:1) -> resized to 900x900 for featured image
+    const squarePng = await sharp({
+      create: {
+        width: 1200,
+        height: 1200,
+        channels: 3,
+        background: { r: 20, g: 83, b: 45 },
+      },
+    })
+      .png()
+      .toBuffer();
+
+    const squareResult = await processImageWithSharp(
+      new Uint8Array(squarePng),
+      900,
+      82
+    );
+    expect(squareResult.width).toBe(900);
+    expect(squareResult.height).toBe(900);
+
+    // 5. Image smaller than target width (400x300 with maxWidth 600) is NOT upscaled
+    const smallPng = await sharp({
+      create: {
+        width: 400,
+        height: 300,
+        channels: 3,
+        background: { r: 100, g: 100, b: 100 },
+      },
+    })
+      .png()
+      .toBuffer();
+
+    const smallResult = await processImageWithSharp(new Uint8Array(smallPng), 600, 80);
+    expect(smallResult.width).toBe(400);
+    expect(smallResult.height).toBe(300);
+    expect(smallResult.wasResized).toBe(false);
+
+    // 6. Transparent RGBA PNG preserves alpha channel when converted to WebP
+    const transparentPng = await sharp({
+      create: {
+        width: 800,
+        height: 600,
+        channels: 4,
+        background: { r: 255, g: 215, b: 0, alpha: 0.35 },
+      },
+    })
+      .png()
+      .toBuffer();
+
+    const transparentWebp = await processImageWithSharp(
+      new Uint8Array(transparentPng),
+      600,
+      80
+    );
+    expect(transparentWebp.width).toBe(600);
+    expect(transparentWebp.height).toBe(450);
+    expect(transparentWebp.hasAlpha).toBe(true);
+
+    const decodedMeta = await sharp(Buffer.from(transparentWebp.webpBytes)).metadata();
+    expect(decodedMeta.format).toBe('webp');
+    expect(decodedMeta.hasAlpha).toBe(true);
+  });
+
+  it('7 & 8. derives deterministic product slugs from URLs, assigns deterministic suffixes for multi-image products, persists mappings in IndexedDB, and flags source-changed conflicts', async () => {
+    resetIdbStorageForTesting();
+
+    // Deterministic slug derivation from full URLs, query strings, and relative /products/ paths
+    expect(
+      deriveProductSlugFromUrl(
+        'https://shop.scienceofgifts.com/products/viking-raven-t-shirt?variant=123#top'
+      )
+    ).toBe('viking-raven-t-shirt');
+    expect(
+      deriveProductSlugFromUrl('/products/Marcus_Aurelius_Stoic_Mug/')
+    ).toBe('marcus-aurelius-stoic-mug');
+
+    expect(
+      buildPublicOptimizedImageUrl(
+        'viking-raven-t-shirt',
+        'https://images.scienceofgifts.com'
+      )
+    ).toBe('https://images.scienceofgifts.com/products/viking-raven-t-shirt.webp');
+
+    expect(buildR2ObjectKey('viking-raven-t-shirt', '-back')).toBe(
+      'products/viking-raven-t-shirt-back.webp'
+    );
+
+    // Deterministic suffixes for multiple distinct images belonging to the same product
+    const multiImageSuffixes = assignDeterministicSuffixesForProductImages([
+      'https://cdn.fourthwall.com/viking-front.png',
+      'https://cdn.fourthwall.com/viking-back.png',
+      'https://cdn.fourthwall.com/viking-closeup-1.png',
+      'https://cdn.fourthwall.com/viking-closeup-2.png',
+    ]);
+    expect(multiImageSuffixes.map((x) => x.variantSuffix)).toEqual([
+      '',
+      '-back',
+      '-detail-1',
+      '-detail-2',
+    ]);
+
+    // Persist mapping in IndexedDB and verify sourceChangedConflict detection
+    const initialMapping: ProductImageMappingRecord = {
+      id: 'viking-raven-t-shirt::https://cdn.fourthwall.com/viking-v1.png',
+      productName: 'Viking Raven T-Shirt',
+      productPageUrl: 'https://shop.scienceofgifts.com/products/viking-raven-t-shirt',
+      baseProductSlug: 'viking-raven-t-shirt',
+      productSlug: 'viking-raven-t-shirt',
+      variantSuffix: '',
+      role: 'standard',
+      originalImageUrl: 'https://cdn.fourthwall.com/viking-v1.png',
+      optimizedImageUrl: 'https://images.scienceofgifts.com/products/viking-raven-t-shirt.webp',
+      r2ObjectKey: 'products/viking-raven-t-shirt.webp',
+      status: 'uploaded',
+    };
+    await saveImageMappingsToIdb([initialMapping]);
+
+    const savedMappings = await getAllImageMappingsFromIdb();
+    expect(savedMappings).toHaveLength(1);
+
+    // Scan guide HTML where the same product now points to a DIFFERENT original image URL (v2)
+    const guideHtmlWithNewSource = `
+      <article class="sog-ed-card">
+        <a href="https://shop.scienceofgifts.com/products/viking-raven-t-shirt">
+          <img class="sog-ed-img" src="https://cdn.fourthwall.com/viking-v2-changed.png" alt="Viking Raven Tee">
+        </a>
+      </article>
+    `;
+    const scanned = scanGuideHtmlForImages(
+      guideHtmlWithNewSource,
+      [],
+      savedMappings,
+      'https://images.scienceofgifts.com'
+    );
+    expect(scanned).toHaveLength(1);
+    expect(scanned[0].productSlug).toBe('viking-raven-t-shirt');
+    expect(scanned[0].sourceChangedConflict).toBe(true);
+  });
+
+  it('9. replaces product image URLs in Guide HTML while preserving alt, width, height, loading, and CSS classes, and leaves unmatched/ambiguous images untouched', () => {
+    const originalGuideHtml = `
+      <section class="sog-guide-container">
+        <div class="sog-editor-pick">
+          <a href="https://shop.scienceofgifts.com/products/viking-raven-t-shirt">
+            <img class="sog-ep-img" src="https://cdn.fourthwall.com/raw/viking-raven-huge.png" alt="Viking Raven Tee" width="900" height="675" loading="eager">
+          </a>
+        </div>
+        <div class="sog-editorial-list">
+          <article class="sog-ed-card">
+            <div class="sog-ed-media">
+              <img class="sog-ed-img" src="https://cdn.fourthwall.com/raw/spqr-mug-old.jpg" data-product-url="/products/spqr-roman-mug" alt="SPQR Ceramic Mug" width="600" height="450" loading="lazy">
+            </div>
+          </article>
+          <article class="sog-ed-card">
+            <div class="sog-ed-media">
+              <img class="sog-ed-img" src="https://cdn.fourthwall.com/raw/unoptimized-poster.jpg" data-product-url="/products/unoptimized-poster" alt="Unoptimized Poster" loading="lazy">
+            </div>
+          </article>
+        </div>
+      </section>
+    `.trim();
+
+    const mappings: ProductImageMappingRecord[] = [
+      {
+        id: 'map-1',
+        productName: 'Viking Raven T-Shirt',
+        productPageUrl: 'https://shop.scienceofgifts.com/products/viking-raven-t-shirt',
+        baseProductSlug: 'viking-raven-t-shirt',
+        productSlug: 'viking-raven-t-shirt',
+        variantSuffix: '',
+        role: 'featured',
+        originalImageUrl: 'https://cdn.fourthwall.com/raw/viking-raven-huge.png',
+        optimizedImageUrl: 'https://images.scienceofgifts.com/products/viking-raven-t-shirt.webp',
+        r2ObjectKey: 'products/viking-raven-t-shirt.webp',
+        status: 'uploaded',
+      },
+      {
+        id: 'map-2',
+        productName: 'SPQR Roman Mug',
+        productPageUrl: 'https://shop.scienceofgifts.com/products/spqr-roman-mug',
+        baseProductSlug: 'spqr-roman-mug',
+        productSlug: 'spqr-roman-mug',
+        variantSuffix: '',
+        role: 'standard',
+        // Different original URL to test unambiguous product-slug fallback matching
+        originalImageUrl: 'https://cdn.fourthwall.com/raw/spqr-mug-original-upload.jpg',
+        optimizedImageUrl: 'https://images.scienceofgifts.com/products/spqr-roman-mug.webp',
+        r2ObjectKey: 'products/spqr-roman-mug.webp',
+        status: 'optimized_locally',
+      },
+    ];
+
+    const result = replaceGuideHtmlImageUrls(originalGuideHtml, mappings, {
+      onlyUploadedOrOptimized: true,
+    });
+
+    expect(result.replacedCount).toBe(2);
+    expect(result.replacements[0]).toMatchObject({
+      productSlug: 'viking-raven-t-shirt',
+      matchMode: 'exact_original_url',
+      nextSrc: 'https://images.scienceofgifts.com/products/viking-raven-t-shirt.webp',
+    });
+    expect(result.replacements[1]).toMatchObject({
+      productSlug: 'spqr-roman-mug',
+      matchMode: 'unambiguous_product_slug',
+      nextSrc: 'https://images.scienceofgifts.com/products/spqr-roman-mug.webp',
+    });
+
+    // Verify attributes (alt, width, height, loading, class) are preserved
+    expect(result.updatedHtml).toContain(
+      'class="sog-ep-img" src="https://images.scienceofgifts.com/products/viking-raven-t-shirt.webp" alt="Viking Raven Tee" width="900" height="675" loading="eager"'
+    );
+    expect(result.updatedHtml).toContain(
+      'class="sog-ed-img" src="https://images.scienceofgifts.com/products/spqr-roman-mug.webp" data-product-url="/products/spqr-roman-mug" alt="SPQR Ceramic Mug" width="600" height="450" loading="lazy"'
+    );
+
+    // Unmatched image is reported and left untouched in the HTML
+    expect(result.unmatchedImages).toHaveLength(1);
+    expect(result.unmatchedImages[0].src).toBe(
+      'https://cdn.fourthwall.com/raw/unoptimized-poster.jpg'
+    );
+    expect(result.updatedHtml).toContain(
+      'src="https://cdn.fourthwall.com/raw/unoptimized-poster.jpg"'
+    );
+  });
+
+  it('10. enforces server-side Firebase ID token verification for R2 uploads, rejects spoofed headers or unauthorized users, and uploads via Worker binding & S3 API using configured bucket name', async () => {
+    // Generate a real WebP binary buffer via Sharp
+    const samplePng = await sharp({
+      create: {
+        width: 300,
+        height: 225,
+        channels: 4,
+        background: { r: 15, g: 81, b: 50, alpha: 1 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const processed = await processImageWithSharp(new Uint8Array(samplePng), 600, 80);
+    const validWebpBase64 = Buffer.from(processed.webpBytes).toString('base64');
+
+    // Generate a real RSA-2048 keypair via Web Crypto to sign test Firebase ID tokens
+    const keyPair = await crypto.subtle.generateKey(
+      {
+        name: 'RSASSA-PKCS1-v1_5',
+        modulusLength: 2048,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: 'SHA-256',
+      },
+      true,
+      ['sign', 'verify']
+    );
+    const publicJwk = (await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as JsonWebKey;
+    const testKid = 'test-firebase-kid-2026';
+    const customJwkSet: GoogleJwkSet = {
+      keys: [
+        {
+          ...publicJwk,
+          kid: testKid,
+          kty: 'RSA',
+          alg: 'RS256',
+          use: 'sig',
+          n: publicJwk.n!,
+          e: publicJwk.e!,
+        },
+      ],
+    };
+
+    const toBase64Url = (input: string | Uint8Array): string => {
+      const buf = typeof input === 'string' ? Buffer.from(input, 'utf-8') : Buffer.from(input);
+      return buf
+        .toString('base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_');
+    };
+
+    const nowSec = 1_760_000_000;
+    const signFirebaseJwt = async (
+      claimsOverride: Record<string, unknown> = {},
+      headerOverride: Record<string, unknown> = {}
+    ): Promise<string> => {
+      const header = { alg: 'RS256', typ: 'JWT', kid: testKid, ...headerOverride };
+      const payload = {
+        iss: 'https://securetoken.google.com/rock-sound-kdtd0',
+        aud: 'rock-sound-kdtd0',
+        sub: 'kXSNJQbhD7fxP64zJgGY5ALlZ1c2',
+        email: 'scienceofgifts@gmail.com',
+        email_verified: true,
+        iat: nowSec - 60,
+        exp: nowSec + 3600,
+        ...claimsOverride,
+      };
+      const unsignedToken = `${toBase64Url(JSON.stringify(header))}.${toBase64Url(
+        JSON.stringify(payload)
+      )}`;
+      const signature = await crypto.subtle.sign(
+        'RSASSA-PKCS1-v1_5',
+        keyPair.privateKey,
+        new TextEncoder().encode(unsignedToken)
+      );
+      return `${unsignedToken}.${toBase64Url(new Uint8Array(signature))}`;
+    };
+
+    const validCmsOwnerToken = await signFirebaseJwt();
+
+    // 10a. Reject path traversal or invalid object keys
+    expect(validateR2ObjectKey('../secrets/evil.webp').valid).toBe(false);
+    expect(validateR2ObjectKey('products/viking-raven.jpg').valid).toBe(false);
+    expect(validateR2ObjectKey('products/viking-raven-t-shirt.webp').valid).toBe(true);
+
+    // 10b. Reject unauthenticated request AND reject spoofable X-SOG-CMS-Client: 1 header
+    const unauthRes = await handleImageUploadR2Request(
+      {
+        objectKey: 'products/viking-raven-t-shirt.webp',
+        webpBase64: validWebpBase64,
+      },
+      {},
+      { cmsClientHeader: '1' },
+      { customJwkSet, nowSeconds: nowSec }
+    );
+    expect(unauthRes.status).toBe(401);
+    expect(unauthRes.body.error).toMatch(/missing Firebase Authentication Bearer token/i);
+
+    // 10c. Reject expired Firebase ID token (401)
+    const expiredToken = await signFirebaseJwt({ exp: nowSec - 120 });
+    const expiredRes = await handleImageUploadR2Request(
+      {
+        objectKey: 'products/viking-raven-t-shirt.webp',
+        webpBase64: validWebpBase64,
+      },
+      {},
+      { authorization: `Bearer ${expiredToken}` },
+      { customJwkSet, nowSeconds: nowSec }
+    );
+    expect(expiredRes.status).toBe(401);
+    expect(expiredRes.body.error).toMatch(/expired/i);
+
+    // 10d. Reject valid Firebase token from an unauthorized user not in the CMS allowlist (403)
+    const unauthorizedUserToken = await signFirebaseJwt({
+      sub: 'unlisted-random-uid-999',
+      email: 'intruder@example.com',
+      email_verified: true,
+    });
+    const forbiddenRes = await handleImageUploadR2Request(
+      {
+        objectKey: 'products/viking-raven-t-shirt.webp',
+        webpBase64: validWebpBase64,
+      },
+      {},
+      { authorization: `Bearer ${unauthorizedUserToken}` },
+      { customJwkSet, nowSeconds: nowSec }
+    );
+    expect(forbiddenRes.status).toBe(403);
+    expect(forbiddenRes.body.error).toMatch(/not an authorized Science of Gifts CMS editor/i);
+
+    // 10e. Reject non-WebP binary payload even with valid Firebase ID token
+    const fakeJpgBase64 = Buffer.from('not-a-valid-riff-webp-file').toString('base64');
+    const badFileRes = await handleImageUploadR2Request(
+      {
+        objectKey: 'products/viking-raven-t-shirt.webp',
+        webpBase64: fakeJpgBase64,
+      },
+      {},
+      { authorization: `Bearer ${validCmsOwnerToken}` },
+      { customJwkSet, nowSeconds: nowSec }
+    );
+    expect(badFileRes.status).toBe(400);
+    expect(badFileRes.body.error).toMatch(/RIFF\/WEBP/i);
+
+    // 10f. Upload via Cloudflare Worker IMAGES_BUCKET binding through workers.ts
+    // Also verify that even if R2_UPLOAD_AUTH_TOKEN is present in env, Firebase ID token auth succeeds
+    const bucketObjects = new Map<string, { bytes: Uint8Array; options: any }>();
+    const mockImagesBucket = {
+      async put(key: string, value: Uint8Array | ArrayBuffer, options?: any) {
+        const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+        bucketObjects.set(key, { bytes, options });
+        return { key, etag: 'etag-mock-123' };
+      },
+      async head(key: string) {
+        return bucketObjects.has(key) ? { key, size: bucketObjects.get(key)!.bytes.length } : null;
+      },
+    };
+
+    const workerUploadReq = new Request('https://cms.scienceofgifts.com/api/images/upload-r2', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${validCmsOwnerToken}`,
+      },
+      body: JSON.stringify({
+        objectKey: 'products/viking-raven-t-shirt.webp',
+        webpBase64: validWebpBase64,
+        publicBaseUrl: 'https://images.scienceofgifts.com',
+      }),
+    });
+
+    const workerRes = await handleWorkerRequest(
+      workerUploadReq,
+      {
+        IMAGES_BUCKET: mockImagesBucket,
+        R2_BUCKET_NAME: 'custom-gifts-r2-bucket',
+        R2_PUBLIC_BASE_URL: 'https://images.scienceofgifts.com',
+        R2_UPLOAD_AUTH_TOKEN: 'legacy-env-secret-that-must-not-block-firebase-auth',
+      },
+      { customJwkSet, nowSeconds: nowSec }
+    );
+    expect(workerRes.status).toBe(200);
+    const workerData = await workerRes.json();
+    expect(workerData.ok).toBe(true);
+    expect(workerData.mode).toBe('worker_binding');
+    expect(workerData.authenticatedUserEmail).toBe('scienceofgifts@gmail.com');
+    expect(workerData.publicUrl).toBe(
+      'https://images.scienceofgifts.com/products/viking-raven-t-shirt.webp'
+    );
+    expect(bucketObjects.has('products/viking-raven-t-shirt.webp')).toBe(true);
+    expect(
+      bucketObjects.get('products/viking-raven-t-shirt.webp')!.options.httpMetadata.contentType
+    ).toBe('image/webp');
+
+    // 10g. Upload via S3-compatible R2 API using a custom configured R2_BUCKET_NAME
+    const s3Requests: Array<{ url: string; method: string; headers: Record<string, string> }> = [];
+    const s3Res = await handleImageUploadR2Request(
+      {
+        objectKey: 'products/spqr-roman-mug.webp',
+        webpBase64: validWebpBase64,
+        publicBaseUrl: 'https://images.scienceofgifts.com',
+        overwrite: true,
+      },
+      {
+        R2_ACCOUNT_ID: 'acc123456',
+        R2_ACCESS_KEY_ID: 'AKIAIOSFODNN7EXAMPLE',
+        R2_SECRET_ACCESS_KEY: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+        R2_BUCKET_NAME: 'my-custom-configured-bucket',
+        R2_PUBLIC_BASE_URL: 'https://images.scienceofgifts.com',
+      },
+      { authorization: `Bearer ${validCmsOwnerToken}` },
+      {
+        customJwkSet,
+        nowSeconds: nowSec,
+        customFetch: async (input, init) => {
+          const urlStr = typeof input === 'string' ? input : input.toString();
+          s3Requests.push({
+            url: urlStr,
+            method: init?.method || 'GET',
+            headers: (init?.headers as Record<string, string>) || {},
+          });
+          return new Response('', { status: 200 });
+        },
+      }
+    );
+    expect(s3Res.status).toBe(200);
+    expect(s3Res.body.mode).toBe('s3_api');
+    expect(s3Requests).toHaveLength(1);
+    expect(s3Requests[0].method).toBe('PUT');
+    expect(s3Requests[0].url).toBe(
+      'https://acc123456.r2.cloudflarestorage.com/my-custom-configured-bucket/products/spqr-roman-mug.webp'
+    );
+  });
+
+  it('11. processes images in Cloudflare Workers using the native Cloudflare Images binding (IMAGES) with WebP output, 600px/900px max widths, quality ~80, aspect ratio preservation, no cropping, no upscaling, and alpha transparency preserved', async () => {
+    const recordedTransforms: Array<{
+      transformOpts: any;
+      outputOpts: any;
+    }> = [];
+
+    // Mock Cloudflare Workers native `env.IMAGES` binding backed by sharp to produce real WebP output bytes
+    const mockCloudflareImagesBinding: CloudflareImagesBinding = {
+      input(stream) {
+        let transformOpts: any = {};
+        return {
+          transform(opts) {
+            transformOpts = { ...transformOpts, ...opts };
+            return this;
+          },
+          async output(outputOpts) {
+            recordedTransforms.push({ transformOpts, outputOpts });
+            const inputAb = await new Response(stream as ReadableStream).arrayBuffer();
+            const outBuf = await sharp(Buffer.from(inputAb))
+              .rotate()
+              .resize({
+                width: transformOpts.width,
+                height: transformOpts.height,
+                fit: 'inside',
+                withoutEnlargement: true,
+              })
+              .webp({
+                quality: outputOpts.quality ?? 80,
+                alphaQuality: 100,
+              })
+              .toBuffer();
+            return {
+              contentType: () => 'image/webp',
+              response: () =>
+                new Response(new Uint8Array(outBuf), {
+                  headers: { 'Content-Type': 'image/webp' },
+                }),
+            };
+          },
+        };
+      },
+    };
+
+    // 11a. Standard product landscape image (1600x1200 -> 600x450, WebP quality 80) via Worker endpoint
+    const landscapePng = await sharp({
+      create: {
+        width: 1600,
+        height: 1200,
+        channels: 4,
+        background: { r: 25, g: 55, b: 109, alpha: 0.5 },
+      },
+    })
+      .png()
+      .toBuffer();
+
+    const workerOptimizeReq = new Request('https://cms.scienceofgifts.com/api/images/optimize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        imageUrl: 'https://cdn.fourthwall.com/products/viking-raven-t-shirt.png',
+        productPageUrl: 'https://shop.scienceofgifts.com/products/viking-raven-t-shirt',
+        role: 'standard',
+      }),
+    });
+
+    const workerOptimizeRes = await handleWorkerRequest(
+      workerOptimizeReq,
+      {
+        IMAGES: mockCloudflareImagesBinding,
+        R2_PUBLIC_BASE_URL: 'https://images.scienceofgifts.com',
+      },
+      {
+        customImageBytesFetcher: async (url) => ({
+          bytes: new Uint8Array(landscapePng),
+          contentType: 'image/png',
+          finalUrl: url,
+        }),
+      }
+    );
+
+    expect(workerOptimizeRes.status).toBe(200);
+    const workerOptBody = await workerOptimizeRes.json();
+    expect(workerOptBody.ok).toBe(true);
+    expect(workerOptBody.productSlug).toBe('viking-raven-t-shirt');
+    expect(workerOptBody.r2ObjectKey).toBe('products/viking-raven-t-shirt.webp');
+    expect(workerOptBody.optimizedImageUrl).toBe(
+      'https://images.scienceofgifts.com/products/viking-raven-t-shirt.webp'
+    );
+    expect(workerOptBody.originalDimensions).toEqual({ width: 1600, height: 1200 });
+    expect(workerOptBody.optimizedDimensions).toEqual({ width: 600, height: 450 });
+    expect(workerOptBody.hasAlpha).toBe(true);
+    expect(recordedTransforms[0]).toEqual({
+      transformOpts: { width: 600, height: 450, fit: 'scale-down' },
+      outputOpts: { format: 'image/webp', quality: 80 },
+    });
+
+    // 11b. Featured portrait image (1200x1800 -> 900x1350, aspect ratio preserved, uncropped)
+    const portraitPng = await sharp({
+      create: {
+        width: 1200,
+        height: 1800,
+        channels: 3,
+        background: { r: 120, g: 40, b: 20 },
+      },
+    })
+      .png()
+      .toBuffer();
+
+    const featuredOut = await processImageWithCloudflareImages(
+      {
+        inputBytes: new Uint8Array(portraitPng),
+        maxWidth: 900,
+        quality: 80,
+      },
+      mockCloudflareImagesBinding
+    );
+    expect(featuredOut.originalWidth).toBe(1200);
+    expect(featuredOut.originalHeight).toBe(1800);
+    expect(featuredOut.optimizedWidth).toBe(900);
+    expect(featuredOut.optimizedHeight).toBe(1350);
+    expect(featuredOut.wasResized).toBe(true);
+
+    // 11c. Small image (400x300 with maxWidth 600) is NEVER upscaled
+    const smallJpeg = await sharp({
+      create: {
+        width: 400,
+        height: 300,
+        channels: 3,
+        background: { r: 80, g: 80, b: 80 },
+      },
+    })
+      .jpeg()
+      .toBuffer();
+
+    const smallParsed = parseImageHeaderMetadata(new Uint8Array(smallJpeg));
+    expect(smallParsed).toEqual({
+      format: 'jpeg',
+      width: 400,
+      height: 300,
+      hasAlpha: false,
+    });
+
+    const smallOut = await processImageWithCloudflareImages(
+      {
+        inputBytes: new Uint8Array(smallJpeg),
+        maxWidth: 600,
+        quality: 80,
+      },
+      mockCloudflareImagesBinding
+    );
+    expect(smallOut.optimizedWidth).toBe(400);
+    expect(smallOut.optimizedHeight).toBe(300);
+    expect(smallOut.wasResized).toBe(false);
+  });
+});
+
+describe('Feature 11: Fourthwall Section-Only Character Limit Validation, >10 MB IndexedDB Persistence, Reload Hydration, Firestore Multi-Document Chunking, and Storage Diagnostics', () => {
+  it('1. treats complete assembled gift guide character counts (e.g. 71,715+ chars across 16 sections) as neutral informational statistics while retaining the 30,000-char limit for individual section exports (including CSS when enabled)', async () => {
+    const store = new Map<string, string>();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => store.set(k, v),
+          removeItem: (k: string) => store.delete(k),
+        },
+        indexedDB: createMockIndexedDbFactory(),
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+
+    // Build 16 sections (~4,500 chars each) so the complete assembled guide is ~72,000 chars
+    const sectionParagraph =
+      '<p>Museum-grade historical replica and archival gift commentary for collectors and educators. </p>';
+    const makeSectionHtml = (idx: number, targetLen: number) => {
+      const header = `<section class="sog-editorial-section" id="jump-sec-${idx}"><h2>Section ${idx}: Historical Curations</h2>`;
+      const footer = '</section>';
+      const bodyRepeat = Math.ceil(
+        Math.max(100, targetLen - header.length - footer.length) / sectionParagraph.length
+      );
+      return `${header}${sectionParagraph.repeat(bodyRepeat)}${footer}`.slice(
+        0,
+        targetLen - footer.length
+      ) + footer;
+    };
+
+    let project = await createNewHtmlProject({
+      name: 'Complete 16-Section World History Gift Guide',
+      initialHtml: makeSectionHtml(1, 4482),
+    });
+    for (let i = 2; i <= 16; i++) {
+      project = appendHtmlSectionToProject(project, makeSectionHtml(i, 4482), {
+        name: `Section ${i}`,
+      });
+    }
+    project = await saveHtmlProject(project);
+
+    expect(project.sections).toHaveLength(16);
+    expect(project.currentHtml.length).toBeGreaterThan(71_000);
+
+    // 1a. Complete project export evaluation MUST be neutral and NEVER report exceedsFourthwallLimit
+    const completeEval = exportCompleteProjectHtml(project, [], { includeCss: false });
+    expect(completeEval.characterCount).toBeGreaterThan(71_000);
+    expect(completeEval.exceedsFourthwallLimit).toBe(false);
+    expect(completeEval.exceedsLimit).toBe(false);
+    expect(completeEval.approachingFourthwallLimit).toBe(false);
+    expect(completeEval.warningMessage).toBeUndefined();
+
+    const completeEvalWithCss = exportCompleteProjectHtml(project, [], { includeCss: true });
+    expect(completeEvalWithCss.characterCount).toBeGreaterThan(80_000);
+    expect(completeEvalWithCss.exceedsFourthwallLimit).toBe(false);
+    expect(completeEvalWithCss.exceedsLimit).toBe(false);
+    expect(completeEvalWithCss.warningMessage).toBeUndefined();
+
+    // 1b. Normal individual section (~4,482 chars, or ~24,000 chars with CSS) is well under 30,000 chars
+    const firstSecId = project.sections![0].id;
+    const normalSecExport = exportProjectSectionHtml(project, firstSecId, [], {
+      includeCss: false,
+    });
+    expect(normalSecExport.characterCount).toBeLessThan(30_000);
+    expect(normalSecExport.exceedsFourthwallLimit).toBe(false);
+    expect(normalSecExport.warningMessage).toBeUndefined();
+
+    // 1c. Section that is 18,000 chars alone is valid without CSS, but when exported WITH a 19,500-char CSS block (total > 37,500 chars) exceeds the 30,000-char per-section limit
+    const mediumSectionHtml = makeSectionHtml(17, 18_000);
+    project = appendHtmlSectionToProject(project, mediumSectionHtml, {
+      name: 'Section 17 Medium',
+    });
+    const sec17Id = project.sections![project.sections!.length - 1].id;
+
+    const sec17HtmlOnly = exportProjectSectionHtml(project, sec17Id, [], { includeCss: false });
+    expect(sec17HtmlOnly.characterCount).toBe(18_000);
+    expect(sec17HtmlOnly.exceedsFourthwallLimit).toBe(false);
+
+    const sec17WithCss = exportProjectSectionHtml(project, sec17Id, [], { includeCss: true });
+    expect(sec17WithCss.characterCount).toBeGreaterThan(30_000);
+    expect(sec17WithCss.exceedsFourthwallLimit).toBe(true);
+    expect(sec17WithCss.warningMessage).toContain('30,000-character limit');
+
+    // 1d. Individual section > 30,000 chars alone triggers per-section warning without truncating HTML
+    const oversizedSecHtml = makeSectionHtml(18, 32_500);
+    project = appendHtmlSectionToProject(project, oversizedSecHtml, {
+      name: 'Section 18 Oversized',
+    });
+    const sec18Id = project.sections![project.sections!.length - 1].id;
+    const sec18Export = exportProjectSectionHtml(project, sec18Id, [], { includeCss: false });
+    expect(sec18Export.characterCount).toBe(32_500);
+    expect(sec18Export.exceedsFourthwallLimit).toBe(true);
+    expect(sec18Export.warningMessage).toContain('30,000-character limit');
+    expect(sec18Export.html.length).toBe(32_500);
+  });
+
+  it('2. stores multiple complete gift guides totaling over 10 MB in IndexedDB and survives a simulated browser reload after clearing in-memory caches', async () => {
+    const store = new Map<string, string>();
+    const mockIdb = createMockIndexedDbFactory();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => {
+            if (v.length > 4_000_000) {
+              throw new Error('QuotaExceededError: localStorage 4MB limit exceeded');
+            }
+            store.set(k, v);
+          },
+          removeItem: (k: string) => store.delete(k),
+        },
+        indexedDB: mockIdb,
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+
+    // Create 8 large guides (~500 KB HTML each -> > 1.5 MB serialized per guide with originalHtml + sections -> > 12 MB total)
+    const cardChunk =
+      '<article class="sog-ed-card"><h3>Archival Museum Edition Gift</h3><p>' +
+      'Comprehensive curatorial notes, historical context, and material specifications. '.repeat(20) +
+      '</p></article>\n';
+    const guideHtml500k = `<section class="sog-guide-container">\n${cardChunk.repeat(290)}</section>`;
+    expect(guideHtml500k.length).toBeGreaterThan(480_000); // Also exceeds old 400 KB single-project limit!
+
+    const createdIds: string[] = [];
+    for (let i = 1; i <= 8; i++) {
+      const proj = await createNewHtmlProject({
+        name: `Mega Historical Gift Guide #${i}`,
+        htmlContent: guideHtml500k,
+      });
+      createdIds.push(proj.id);
+    }
+
+    // Edit Guide #8 and save
+    const allBeforeReload = await loadLocalHtmlProjectsAsync();
+    expect(allBeforeReload).toHaveLength(8);
+    const totalBytes = JSON.stringify(allBeforeReload).length;
+    expect(totalBytes).toBeGreaterThan(10_500_000); // > 10.5 MB total stored in IndexedDB
+
+    const guide8 = allBeforeReload.find((p) => p.id === createdIds[7])!;
+    const editedHtml = guide8.currentHtml + '\n<!-- VERIFIED_RELOAD_MARKER_2026 -->';
+    await saveHtmlProject({
+      ...guide8,
+      name: 'Mega Historical Gift Guide #8 (Edited)',
+      currentHtml: editedHtml,
+    });
+
+    // Simulate a real browser page reload: clear all in-memory caches while keeping mockIdb intact
+    simulateBrowserReloadForTesting();
+    expect(loadLocalHtmlProjects()).toHaveLength(0); // Synchronous cache is empty before async hydration
+
+    // Re-hydrate from IndexedDB as HtmlEditorWorkspace does on mount
+    const activeIdAfterReload = await getActiveHtmlProjectIdAsync();
+    const hydratedAfterReload = await loadLocalHtmlProjectsAsync();
+
+    expect(activeIdAfterReload).toBe(createdIds[7]);
+    expect(hydratedAfterReload).toHaveLength(8);
+    const reloadedGuide8 = hydratedAfterReload.find((p) => p.id === createdIds[7])!;
+    expect(reloadedGuide8.name).toBe('Mega Historical Gift Guide #8 (Edited)');
+    expect(reloadedGuide8.currentHtml.endsWith('<!-- VERIFIED_RELOAD_MARKER_2026 -->')).toBe(true);
+    expect(reloadedGuide8.currentHtml.length).toBe(editedHtml.length); // Zero silent truncation!
+  });
+
+  it('3. preserves existing IndexedDB projects during legacy localStorage migration, keeps legacy localStorage intact if migration fails, and migrates catalog products out of localStorage', async () => {
+    const store = new Map<string, string>();
+    const mockIdb = createMockIndexedDbFactory();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => store.set(k, v),
+          removeItem: (k: string) => store.delete(k),
+        },
+        indexedDB: mockIdb,
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+
+    // 3a. Pre-populate IndexedDB with a newer version of proj-shared and an existing idb-only project
+    await saveHtmlProject({
+      id: 'proj-shared',
+      ownerId: 'local-preview',
+      name: 'Newer IDB Version of Shared Guide',
+      currentHtml: '<section><h2>Newer IDB Content</h2></section>',
+      originalHtml: '<section><h2>Newer IDB Content</h2></section>',
+      baseUrl: 'https://scienceofgifts.com',
+      editorState: {
+        viewMode: 'split',
+        selectedBlockId: 'ALL',
+        sidebarTab: 'blocks',
+        previewViewport: 'desktop',
+        includeFourthwallCss: true,
+      },
+      createdAt: '2026-02-01T00:00:00.000Z',
+      updatedAt: '2026-03-10T00:00:00.000Z',
+    });
+
+    // Put an older version of proj-shared + a legacy-only project in localStorage
+    const legacyPayload = JSON.stringify([
+      {
+        id: 'proj-shared',
+        ownerId: 'local-preview',
+        name: 'Older Legacy Version of Shared Guide',
+        currentHtml: '<section><h2>Older Legacy Content</h2></section>',
+        originalHtml: '<section><h2>Older Legacy Content</h2></section>',
+        baseUrl: 'https://scienceofgifts.com',
+        createdAt: '2026-02-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+      {
+        id: 'proj-legacy-only',
+        ownerId: 'local-preview',
+        name: 'Legacy Only Guide',
+        currentHtml: '<section><h2>Legacy Only Content</h2></section>',
+        originalHtml: '<section><h2>Legacy Only Content</h2></section>',
+        baseUrl: 'https://scienceofgifts.com',
+        createdAt: '2026-01-05T00:00:00.000Z',
+        updatedAt: '2026-01-06T00:00:00.000Z',
+      },
+    ]);
+    store.set(LEGACY_LOCAL_HTML_PROJECTS_KEY, legacyPayload);
+    store.delete(LOCAL_HTML_PROJECTS_MIGRATED_KEY);
+
+    // 3b. Simulate an IndexedDB failure during migration and verify legacy localStorage data is NOT deleted
+    try {
+      setSimulatedIdbFailureForTesting('quota_exceeded');
+      await expect(migrateLocalStorageProjectsToIdb()).rejects.toThrow(/Migration failure/i);
+      expect(store.get(LEGACY_LOCAL_HTML_PROJECTS_KEY)).toBe(legacyPayload);
+    } finally {
+      setSimulatedIdbFailureForTesting('none');
+    }
+
+    // 3c. Now let migration succeed and verify both projects exist and newer IDB record was preserved
+    const migRes = await migrateLocalStorageProjectsToIdb();
+    expect(migRes.migratedCount).toBe(2);
+    expect(store.has(LEGACY_LOCAL_HTML_PROJECTS_KEY)).toBe(false);
+
+    const hydrated = await loadLocalHtmlProjectsAsync();
+    expect(hydrated).toHaveLength(2);
+    const shared = hydrated.find((p) => p.id === 'proj-shared')!;
+    expect(shared.name).toBe('Newer IDB Version of Shared Guide');
+    expect(shared.currentHtml).toContain('Newer IDB Content');
+    expect(hydrated.some((p) => p.id === 'proj-legacy-only')).toBe(true);
+
+    // 3d. Verify sog_catalog_products_v2 migrates from localStorage to IndexedDB catalog_products store
+    store.set(
+      'sog_catalog_products_v2',
+      JSON.stringify([
+        {
+          ...SEED_PRODUCTS[0],
+          id: 'migrated-catalog-prod-1',
+          name: 'Migrated Roman Coin Replica',
+        },
+      ])
+    );
+    simulateBrowserReloadForTesting();
+    const migratedCatalog = await loadLocalCatalogProductsAsync();
+    expect(migratedCatalog).not.toBeNull();
+    expect(migratedCatalog![0].id).toBe('migrated-catalog-prod-1');
+    expect(store.has('sog_catalog_products_v2')).toBe(false);
+  });
+
+  it('4. chunks large projects (>500 KB) across backward-compatible Firestore documents that satisfy firestore.rules, reassembles them losslessly, and accurately tracks local vs cloud sync status', async () => {
+    const store = new Map<string, string>();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => store.set(k, v),
+          removeItem: (k: string) => store.delete(k),
+        },
+        indexedDB: createMockIndexedDbFactory(),
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+
+    // 4a. Build a 550 KB guide that exceeds the single-document 400,000-char Firestore rule limit
+    const largeHtml = `<section class="sog-editorial-section"><h2>Large Cloud Guide</h2><p>${'B'.repeat(
+      550_000
+    )}</p></section>`;
+    const largeProject: HtmlEditorProject = ensureProjectHasSections({
+      id: 'cloud-chunked-guide',
+      ownerId: 'user-123',
+      name: 'Chunked Cloud Guide',
+      currentHtml: largeHtml,
+      originalHtml: largeHtml,
+      baseUrl: 'https://scienceofgifts.com',
+      customCss: DEFAULT_GIFT_GUIDE_CSS,
+      editorState: {
+        viewMode: 'split',
+        selectedBlockId: 'ALL',
+        sidebarTab: 'blocks',
+        previewViewport: 'desktop',
+        includeFourthwallCss: true,
+      },
+      createdAt: '2026-03-01T00:00:00.000Z',
+      updatedAt: '2026-03-02T00:00:00.000Z',
+    });
+
+    const plan = buildFirestoreHtmlProjectPayloads('user-123', largeProject);
+    expect(plan.isChunked).toBe(true);
+    expect(plan.chunkDocs.length).toBeGreaterThanOrEqual(4);
+
+    // Verify every generated document strictly satisfies firestore.rules constraints:
+    // currentHtml.size() <= 400000, originalHtml.size() <= 400000, editorState.keys().size() <= 15
+    expect(plan.parentPayload.currentHtml.length).toBeLessThanOrEqual(400_000);
+    expect(plan.parentPayload.originalHtml.length).toBeLessThanOrEqual(400_000);
+    expect(Object.keys(plan.parentPayload.editorState).length).toBeLessThanOrEqual(15);
+    for (const chunkDoc of plan.chunkDocs) {
+      expect(chunkDoc.payload.currentHtml.length).toBeLessThanOrEqual(400_000);
+      expect(chunkDoc.payload.originalHtml.length).toBeLessThanOrEqual(400_000);
+      expect(Object.keys(chunkDoc.payload.editorState).length).toBeLessThanOrEqual(15);
+    }
+
+    // Reassemble from raw Firestore docs and verify 100% lossless restoration (and chunk parts are hidden)
+    const rawFirestoreDocs = [
+      { id: plan.parentId, data: plan.parentPayload },
+      ...plan.chunkDocs.map((c) => ({ id: c.id, data: c.payload })),
+    ];
+    const reassembled = reassembleFirestoreHtmlProjects(rawFirestoreDocs, 'user-123');
+    expect(reassembled).toHaveLength(1);
+    expect(reassembled[0].id).toBe('cloud-chunked-guide');
+    expect(reassembled[0].currentHtml.length).toBe(largeHtml.length);
+    expect(reassembled[0].originalHtml.length).toBe(largeHtml.length);
+
+    // 4b. Test saveHtmlProject sync statuses:
+    // - Firestore offline -> saved_local_cloud_pending (no false confirmed cloud save!)
+    const offlineSaved = await saveHtmlProject(largeProject, 'user-123', {
+      firestoreWriter: async () => {
+        throw new Error('FirebaseError: Failed to get document because the client is offline.');
+      },
+    });
+    expect(offlineSaved.syncStatus).toBe('saved_local_cloud_pending');
+    expect(offlineSaved.pendingCloudSync).toBe(true);
+
+    // - Firestore permission/size failure -> saved_local_cloud_failed (local save preserved!)
+    const failedCloudSaved = await saveHtmlProject(largeProject, 'user-123', {
+      firestoreWriter: async () => {
+        throw new Error('Missing or insufficient permissions.');
+      },
+    });
+    expect(failedCloudSaved.syncStatus).toBe('saved_local_cloud_failed');
+    expect(failedCloudSaved.pendingCloudSync).toBe(true);
+    expect(failedCloudSaved.syncDiagnostic).toMatch(/permission or network failure/i);
+
+    // - Firestore success -> saved_local_and_cloud
+    const syncedCloudSaved = await saveHtmlProject(largeProject, 'user-123', {
+      firestoreWriter: async () => 'cloud-chunked-guide',
+    });
+    expect(syncedCloudSaved.syncStatus).toBe('saved_local_and_cloud');
+    expect(syncedCloudSaved.pendingCloudSync).toBe(false);
+
+    // 4c. Verify mergeCloudAndLocalHtmlProjects never overwrites pending local edits or hides local-only guides
+    const localPendingGuide: HtmlEditorProject = {
+      ...largeProject,
+      id: 'guide-shared',
+      name: 'Local Unsynced Edit',
+      updatedAt: '2026-03-05T12:00:00.000Z',
+      syncStatus: 'saved_local_cloud_pending',
+      pendingCloudSync: true,
+    };
+    const localOnlyGuide: HtmlEditorProject = {
+      ...largeProject,
+      id: 'guide-local-only',
+      name: 'Local Only Guide',
+      updatedAt: '2026-03-04T00:00:00.000Z',
+      syncStatus: 'saved_local_only',
+    };
+    const staleCloudSnapshot: HtmlEditorProject = {
+      ...largeProject,
+      id: 'guide-shared',
+      name: 'Stale Cloud Version',
+      updatedAt: '2026-03-01T00:00:00.000Z',
+    };
+    const restoredFromCloudGuide: HtmlEditorProject = {
+      ...largeProject,
+      id: 'guide-cloud-restored',
+      name: 'Restored Cloud Guide',
+      updatedAt: '2026-03-06T00:00:00.000Z',
+    };
+
+    const merged = mergeCloudAndLocalHtmlProjects(
+      [staleCloudSnapshot, restoredFromCloudGuide],
+      [localPendingGuide, localOnlyGuide]
+    );
+    expect(merged.map((p) => p.id)).toEqual([
+      'guide-cloud-restored',
+      'guide-shared',
+      'guide-local-only',
+    ]);
+    expect(merged.find((p) => p.id === 'guide-shared')!.name).toBe('Local Unsynced Edit');
+
+    // 4d. Verify storage diagnostic classification & credential scrubbing
+    const scrubbedErr = classifyStorageFailure(
+      new Error('QuotaExceededError with Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.secret.sig'),
+      'idb'
+    );
+    expect(scrubbedErr).toBeInstanceOf(StorageDiagnosticError);
+    expect(scrubbedErr.category).toBe('idb_quota_exceeded');
+    expect(scrubbedErr.message).not.toContain('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9');
+    expect(scrubbedErr.message).toContain('[REDACTED_TOKEN]');
+  });
+});
+
+describe('Feature 12: Editable, Replaceable, and Persistent Fourthwall Header CSS (Live Preview Reference)', () => {
+  it('1 & 2 & 7. edits and replaces the Fourthwall Header CSS with raw CSS or <style>-wrapped CSS without truncating large stylesheets', async () => {
+    const store = new Map<string, string>();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => store.set(k, v),
+          removeItem: (k: string) => store.delete(k),
+          clear: () => store.clear(),
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+
+    // Initially defaults to DEFAULT_GIFT_GUIDE_CSS
+    const initialHeader = await loadFourthwallHeaderCssAsync();
+    expect(initialHeader.currentCss).toBe(DEFAULT_GIFT_GUIDE_CSS);
+    expect(initialHeader.previousCss).toBeNull();
+    expect(initialHeader.isCustomized).toBe(false);
+
+    // 1. Edit existing Header CSS (adding a new rule to the existing stylesheet)
+    const editedHeaderCss = `${initialHeader.currentCss}\n/* 2026 Header Update */\n.sog-header-badge { background: #1e3a8a; color: #ffffff; }`;
+    const afterEdit = await saveFourthwallHeaderCss(editedHeaderCss);
+    expect(afterEdit.currentCss).toBe(editedHeaderCss);
+    expect(afterEdit.previousCss).toBe(DEFAULT_GIFT_GUIDE_CSS);
+    expect(afterEdit.isCustomized).toBe(true);
+
+    // 2 & 7. Replace entire Header CSS with a large <style>-wrapped stylesheet (verifying no duplicate <style> tags and zero truncation)
+    const largeRules = Array.from(
+      { length: 400 },
+      (_, idx) => `.sog-fw-rule-${idx + 1} { padding: ${(idx % 16) + 4}px; border-color: #123456; }`
+    ).join('\n');
+    const fullReplacementRaw = `/* Fourthwall Site Header 2026 v3 */\n.sog-guide-container { max-width: 1360px; margin: 0 auto; }\n${largeRules}`;
+    const styleWrappedInput = `<style type="text/css">\n${fullReplacementRaw}\n</style>`;
+
+    expect(normalizeHeaderCssInput(styleWrappedInput)).toBe(fullReplacementRaw);
+    expect(normalizeHeaderCssInput(styleWrappedInput)).not.toContain('<style');
+    expect(normalizeHeaderCssInput(styleWrappedInput)).not.toContain('</style>');
+
+    const afterReplace = await saveFourthwallHeaderCss(styleWrappedInput);
+    expect(afterReplace.currentCss).toBe(fullReplacementRaw);
+    expect(afterReplace.currentCss.length).toBe(fullReplacementRaw.length);
+    expect(afterReplace.currentCss).not.toContain('<style');
+    // Previous version is preserved as the edited version from step 1
+    expect(afterReplace.previousCss).toBe(editedHeaderCss);
+  });
+
+  it('3 & 4 & 5 & 6. persists across browser reloads, project migrations, and guide switches, updates Live Preview immediately without stale stylesheets, and restores the previous version', async () => {
+    const store = new Map<string, string>();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => store.set(k, v),
+          removeItem: (k: string) => store.delete(k),
+          clear: () => store.clear(),
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+
+    // Create two gift guides before updating Header CSS
+    const guideOne = await createNewHtmlProject({
+      name: 'Ancient Rome Gift Guide',
+      htmlContent: '<section class="sog-guide-container" id="sec-rome"><h2>Roman Gifts</h2></section>',
+    });
+    const guideTwo = await createNewHtmlProject({
+      name: 'World War II Gift Guide',
+      htmlContent: '<section class="sog-guide-container" id="sec-ww2"><h2>WWII Gifts</h2></section>',
+    });
+
+    const headerV1 = '/* Fourthwall Header V1 */ .sog-guide-container { max-width: 1180px; background: #faf8f5; }';
+    const headerV2 = '/* Fourthwall Header V2 */ .sog-guide-container { max-width: 1440px; background: #0f172a; color: #f8fafc; }';
+
+    await saveFourthwallHeaderCss(headerV1);
+    await saveFourthwallHeaderCss(`<style>\n${headerV2}\n</style>`);
+
+    // 5. Live Preview updates immediately for both existing guides and newly created guides
+    const guideThree = await createNewHtmlProject({
+      name: 'Greek Mythology Gift Guide',
+      htmlContent: '<section class="sog-guide-container" id="sec-greek"><h2>Greek Gifts</h2></section>',
+    });
+
+    for (const guide of [guideOne, guideTwo, guideThree]) {
+      const safeBody = buildSafePreviewHtml(guide.currentHtml, []);
+      const previewDoc = buildPreviewIframeDocument(safeBody, resolveProjectCss(guide), true);
+      expect(previewDoc).toContain(headerV2);
+      // Must NOT contain stale V1 or stale default LOCKED_FOURTHWALL_CSS
+      expect(previewDoc).not.toContain(headerV1);
+      expect(previewDoc).not.toContain('/* 1. CHAPTER BANNERS */');
+      // Only one #sog-fourthwall-header-css style block in <head>
+      const headerStyleMatches = previewDoc.match(/id="sog-fourthwall-header-css"/g) || [];
+      expect(headerStyleMatches).toHaveLength(1);
+    }
+
+    // 3. Simulate browser reload and verify Header CSS is never overwritten during initialization or migration
+    simulateBrowserReloadForTesting();
+    const reloadedProjects = await loadLocalHtmlProjectsAsync();
+    expect(reloadedProjects).toHaveLength(3);
+
+    const reloadedHeader = await loadFourthwallHeaderCssAsync();
+    expect(reloadedHeader.currentCss).toBe(headerV2);
+    expect(reloadedHeader.previousCss).toBe(headerV1);
+    expect(getFourthwallHeaderCssSync().currentCss).toBe(headerV2);
+
+    // Preview after reload still uses headerV2
+    const previewAfterReload = buildPreviewIframeDocument(
+      '<section class="sog-guide-container"><h2>Reload Check</h2></section>',
+      resolveProjectCss(reloadedProjects[0]),
+      true
+    );
+    expect(previewAfterReload).toContain(headerV2);
+    expect(previewAfterReload).not.toContain('/* 1. CHAPTER BANNERS */');
+
+    // 6. Restore Previous Version restores headerV1 and updates Live Preview immediately
+    const restored = await restorePreviousFourthwallHeaderCss();
+    expect(restored.currentCss).toBe(headerV1);
+    expect(restored.previousCss).toBe(headerV2);
+
+    const previewAfterRestore = buildPreviewIframeDocument(
+      '<section class="sog-guide-container"><h2>Restore Check</h2></section>',
+      resolveProjectCss(reloadedProjects[0]),
+      true
+    );
+    expect(previewAfterRestore).toContain(headerV1);
+    expect(previewAfterRestore).not.toContain(headerV2);
+  });
+
+  it('8 & 9. keeps Fourthwall Header CSS strictly separated from exported guide HTML and guide-specific CSS Editor, and reports storage failures clearly', async () => {
+    const store = new Map<string, string>();
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: {
+          getItem: (k: string) => store.get(k) ?? null,
+          setItem: (k: string, v: string) => store.set(k, v),
+          removeItem: (k: string) => store.delete(k),
+          clear: () => store.clear(),
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    resetIdbStorageForTesting();
+
+    const customGlobalHeaderCss =
+      '/* GLOBAL SITE HEADER CSS ONLY FOR PREVIEW */ .site-global-nav { height: 88px; background: #111827; }';
+    await saveFourthwallHeaderCss(customGlobalHeaderCss);
+
+    let guide = await createNewHtmlProject({
+      name: 'Export Separation Test Guide',
+      htmlContent:
+        '<section class="sog-guide-container" id="sec-export-1"><h2>Section 1</h2></section>',
+    });
+    guide = appendHtmlSectionToProject(
+      guide,
+      '<section class="sog-guide-container" id="sec-export-2"><h2>Section 2</h2></section>'
+    );
+
+    // 8. Exported HTML (both complete guide and individual sections) must NEVER automatically include the Fourthwall Header CSS
+    const exportedCompleteDefault = exportCompleteProjectHtml(guide);
+    expect(exportedCompleteDefault.html).not.toContain(customGlobalHeaderCss);
+    expect(exportedCompleteDefault.html).not.toContain('<style>');
+    expect(exportedCompleteDefault.html).toContain('Section 1');
+    expect(exportedCompleteDefault.html).toContain('Section 2');
+
+    const exportedSectionDefault = exportProjectSectionHtml(guide, guide.sections![0].id);
+    expect(exportedSectionDefault.html).not.toContain(customGlobalHeaderCss);
+    expect(exportedSectionDefault.html).not.toContain('<style>');
+
+    // Individual HTML sections in project storage never duplicate or contain the Header CSS
+    for (const sec of guide.sections!) {
+      expect(sec.htmlContent).not.toContain(customGlobalHeaderCss);
+    }
+
+    // 9. Guide-specific CSS Editor remains completely independent from Fourthwall Header CSS
+    const guideSpecificCss = '/* Guide-Specific Override */ .sog-ed-card { border: 2px solid #b45309; }';
+    guide = updateProjectCss(guide, guideSpecificCss);
+    await saveHtmlProject(guide);
+
+    expect(resolveProjectCss(guide)).toBe(guideSpecificCss);
+    expect(getFourthwallHeaderCssSync().currentCss).toBe(customGlobalHeaderCss);
+
+    // Live Preview includes BOTH the global Fourthwall Header CSS AND the guide-specific custom CSS without duplication
+    const combinedPreview = buildPreviewIframeDocument(
+      guide.currentHtml,
+      resolveProjectCss(guide),
+      true
+    );
+    expect(combinedPreview).toContain(customGlobalHeaderCss);
+    expect(combinedPreview).toContain(guideSpecificCss);
+    expect(combinedPreview).not.toContain('/* 1. CHAPTER BANNERS */');
+
+    // Exporting with guide-specific CSS includes ONLY guideSpecificCss and NEVER customGlobalHeaderCss
+    const exportedWithGuideCss = exportCompleteProjectHtml(guide);
+    expect(exportedWithGuideCss.html).toContain(guideSpecificCss);
+    expect(exportedWithGuideCss.html).not.toContain(customGlobalHeaderCss);
+
+    // Cloud sync filters out the internal global Header CSS doc from the gift guide projects list
+    const cloudHeaderDoc = {
+      id: FIRESTORE_GLOBAL_HEADER_CSS_DOC_ID,
+      data: {
+        ownerId: 'user-123',
+        name: 'Fourthwall Header CSS (Live Preview Reference)',
+        currentHtml: customGlobalHeaderCss,
+        originalHtml: DEFAULT_GIFT_GUIDE_CSS,
+        baseUrl: 'https://scienceofgifts.com',
+        editorState: { isGlobalHeaderCssSetting: true },
+        updatedAt: '2026-04-01T00:00:00.000Z',
+      },
+    };
+    const reassembledGuides = reassembleFirestoreHtmlProjects([cloudHeaderDoc], 'user-123');
+    expect(reassembledGuides).toHaveLength(0);
+    const syncedHeader = await syncCloudFourthwallHeaderCssFromDocs([cloudHeaderDoc]);
+    expect(syncedHeader?.currentCss).toBe(customGlobalHeaderCss);
+
+    // Persistence failures throw a clear StorageDiagnosticError instead of falsely succeeding
+    setSimulatedIdbFailureForTesting('quota_exceeded');
+    await expect(
+      saveFourthwallHeaderCss('/* Will Fail */ .test { color: red; }')
+    ).rejects.toThrow(/IndexedDB quota exceeded/i);
+    setSimulatedIdbFailureForTesting('none');
+    // Unsaved failed edit did not corrupt the previously saved Header CSS
+    expect((await loadFourthwallHeaderCssAsync()).currentCss).toBe(customGlobalHeaderCss);
+  });
+});
+
+
+

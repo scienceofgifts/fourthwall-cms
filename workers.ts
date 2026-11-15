@@ -14,6 +14,9 @@ import {
   handleAiAnalyzeHtmlRequest,
   handleAiGenerateRequest,
   handleAiStatusRequest,
+  handleImageOptimizeRequest,
+  handleImageOptimizerStatusRequest,
+  handleImageUploadR2Request,
   handleProductFetchUrlRequest,
   handleProductParseHtmlRequest,
 } from './src/services/serverApiHandlers';
@@ -28,7 +31,7 @@ export interface WorkerEnv extends ServerEnvironment {
   ASSETS?: AssetsFetcher;
 }
 
-const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024; // 2 MB
+const MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 
 const JSON_HEADERS: Record<string, string> = {
   'Content-Type': 'application/json; charset=utf-8',
@@ -56,7 +59,7 @@ async function parseJsonBodySafely(
       return {
         ok: false,
         status: 413,
-        error: 'Request payload exceeds the 2 MB size limit.',
+        error: 'Request payload exceeds the 10 MB size limit.',
       };
     }
   }
@@ -76,7 +79,7 @@ async function parseJsonBodySafely(
     return {
       ok: false,
       status: 413,
-      error: 'Request payload exceeds the 2 MB size limit.',
+      error: 'Request payload exceeds the 10 MB size limit.',
     };
   }
 
@@ -131,11 +134,21 @@ export async function handleWorkerRequest(
       return jsonResponse(res.status, res.body);
     }
 
+    if (pathname === '/api/images/status') {
+      if (method !== 'GET') {
+        return jsonResponse(405, { error: 'Method Not Allowed. Use GET for /api/images/status.' });
+      }
+      const res = handleImageOptimizerStatusRequest(env);
+      return jsonResponse(res.status, res.body);
+    }
+
     if (
       pathname === '/api/products/fetch-url' ||
       pathname === '/api/products/parse-html' ||
       pathname === '/api/ai/analyze-html' ||
-      pathname === '/api/ai/generate'
+      pathname === '/api/ai/generate' ||
+      pathname === '/api/images/optimize' ||
+      pathname === '/api/images/upload-r2'
     ) {
       if (method !== 'POST') {
         return jsonResponse(405, { error: `Method Not Allowed. Use POST for ${pathname}.` });
@@ -163,6 +176,23 @@ export async function handleWorkerRequest(
 
       if (pathname === '/api/ai/generate') {
         const res = await handleAiGenerateRequest(parsedBody.data, env, handlerOptions);
+        return jsonResponse(res.status, res.body);
+      }
+
+      if (pathname === '/api/images/optimize') {
+        const res = await handleImageOptimizeRequest(parsedBody.data, env, handlerOptions);
+        return jsonResponse(res.status, res.body);
+      }
+
+      if (pathname === '/api/images/upload-r2') {
+        const res = await handleImageUploadR2Request(
+          parsedBody.data,
+          env,
+          {
+            authorization: request.headers.get('authorization') || undefined,
+          },
+          handlerOptions
+        );
         return jsonResponse(res.status, res.body);
       }
     }
